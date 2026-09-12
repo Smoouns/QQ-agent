@@ -25,7 +25,7 @@ const state = {
   pauseReason: null,
   autoFollowRunning: true,
   settingsSection: 'api',
-  memoryView: 'events',
+  memoryView: 'persons',
   currentMemoryChatKey: null,
   groupMembers: [],
   groupMembersLoaded: false,
@@ -1775,7 +1775,9 @@ async function loadMemoryView() {
   try {
     const [cfg, chats] = await Promise.all([api('/api/config'), api('/api/chats')]);
     state.config = cfg;
-    const files = await api('/api/memory-files');
+    const [files, people, records] = await Promise.all([api('/api/memory-files'), api('/api/memory/persons'), api('/api/memory/records?includeInactive=true')]);
+    state.memoryPersons = people.persons || [];
+    state.allMemoryRecords = records.records || [];
     state.memoryFiles = files.files || [];
     state.chats = chats.chats || [];
     // 用后端状态校正本地记录：覆盖"页面刚刷新""SSE 断连期间状态变化"两种情况。
@@ -1826,233 +1828,103 @@ function startConsolidateTicker() {
   }, 1000);
 }
 
+const memoryKinds = { fact: '事实', preference: '偏好', interaction: '交流习惯', relationship: '关系', event: '事件', commitment: '承诺' };
+const memoryStatuses = { active: '有效', pending: '待进行', in_progress: '进行中', completed: '已完成', cancelled: '已取消', superseded: '已替代', expired: '已过期', deleted: '已删除' };
+const memoryEvidence = { explicit: '本人明确表达', reported: '他人转述', inferred: '推断／待核实', admin: '人工确认', legacy: '历史导入／缺少原始证据' };
+function memoryScopeLabel(r) { return r.visibility.type === 'global' ? '全局' : r.visibility.chatKeys.join('、'); }
 function renderMemoryList() {
   const box = $('#memory-items');
-  const files = state.memoryFiles || [];
-  const names = {};
-  for (const c of state.chats || []) names[c.key] = formatChatTitle(c.key, chatNameOf(c.key));
-  if (!files.length) {
-    box.innerHTML = '<div class="list-head muted">还没有任何记忆（等机器人使用记忆工具后才会出现）</div>';
-    return;
-  }
-  box.innerHTML = files.map((f) => {
-    const key = f.chatKey;
-    const busy = !!state.consolidating[key];
-    // 整理中：在列表项上直接标出，切页签回来也能一眼看到
-    const busyHtml = busy
-      ? `<span class="unread-pill" style="background:var(--color-background-warning)">整理中…</span>`
-      : '';
-    const sub = busy
-      ? '正在整理本群记忆'
-      : (f.memberCount
-        ? `${f.memberCount} 位群友 · ${f.impressionCount} 条印象`
-        : '暂无群友印象');
-    return `
-      <div class="chat-item ${key === state.currentMemoryChatKey ? 'selected' : ''}" data-key="${esc(key)}">
-        <div class="chat-item-title">
-          <span class="session-chat">${esc(names[key] || key)}</span>
-          ${busyHtml}
-        </div>
-        <div class="chat-item-sub">${esc(sub)}</div>
-        <div class="session-meta"><span>更新于 ${fmtTime(f.updatedAt || 0)}</span></div>
-      </div>`;
-  }).join('');
-  $$('.chat-item', box).forEach((el) => {
-    el.addEventListener('click', () => {
-      state.currentMemoryChatKey = el.dataset.key;
-      renderMemoryList();
-      loadMemoryDetail(state.currentMemoryChatKey);
-    });
-  });
+  const mode = state.memoryView || 'persons';
+  const tabs = '<div class="field-row" style="padding:10px">' + [['persons','人物'],['events','事件'],['chats','会话']].map(([id,label]) => '<button class="btn btn-small ' + (mode === id ? 'btn-primary' : '') + '" data-memory-mode="' + id + '">' + label + '</button>').join('') + '</div>';
+  let rows = [];
+  if (mode === 'persons') rows = (state.memoryPersons || []).map((p) => ({ key: 'person:' + p.id, title: (state.config?.memberNotes?.[p.userId] || p.name || p.userId || '待确认身份'), sub: (p.userId ? 'QQ ' + p.userId : '历史条目：身份待确认') + ' · ' + p.recordCount + ' 条记忆' }));
+  else if (mode === 'events') rows = [{ key: 'events', title: '事件与承诺', sub: '共同经历、进展和待办状态' }];
+  else rows = (state.memoryFiles || []).map((f) => ({ key: f.chatKey, title: formatChatTitle(f.chatKey, chatNameOf(f.chatKey)), sub: state.consolidating[f.chatKey] ? '正在处理新消息…' : '按来源会话查看与增量更新' }));
+  box.innerHTML = tabs + rows.map((r) => '<div class="chat-item ' + (state.currentMemoryChatKey === r.key ? 'selected' : '') + '" data-key="' + esc(r.key) + '"><div class="chat-item-title">' + esc(r.title) + '</div><div class="chat-item-sub">' + esc(r.sub) + '</div></div>').join('') + (!rows.length ? '<div class="empty-hint">暂无记忆。可在会话中添加或处理新消息。</div>' : '');
+  $$('[data-memory-mode]', box).forEach((b) => b.addEventListener('click', () => { state.memoryView = b.dataset.memoryMode; state.currentMemoryChatKey = null; renderMemoryList(); $('#memory-detail').innerHTML = '<div class="empty-hint">选择左侧人物、事件或会话</div>'; }));
+  $$('.chat-item', box).forEach((b) => b.addEventListener('click', () => { state.currentMemoryChatKey = b.dataset.key; renderMemoryList(); loadMemoryDetail(b.dataset.key); }));
 }
 
-async function loadMemoryDetail(chatKey) {
+async function loadMemoryDetail(key) {
   const detail = $('#memory-detail');
   detail.innerHTML = '<div class="empty-hint">加载中…</div>';
   try {
-    const [mem, cfg] = await Promise.all([
-      api(`/api/memory-files/${chatKey.replace(':', '_')}`),
-      api('/api/config')
+    const isPerson = key.startsWith('person:'), isChat = /^(group|private):\d+$/.test(key);
+    const query = new URLSearchParams({ includeInactive: 'true' });
+    if (isPerson) query.set('personId', key.slice(7));
+    if (isChat) query.set('chatKey', key);
+    const [data, personData, chatData] = await Promise.all([
+      api('/api/memory/records?' + query),
+      isPerson ? api('/api/memory/persons/' + encodeURIComponent(key.slice(7))) : null,
+      isChat ? api('/api/memory-files/' + key.replace(':','_')) : null
     ]);
-    const notes = cfg.memberNotes || {};
-    const kind = chatKey.startsWith('group') ? 'group' : 'private';
-    const chatId = chatKey.split(':')[1] || '';
-    const members = Array.isArray(mem.members) ? mem.members : [];
-    const membersHtml = kind === 'group'
-      ? `<div class="field" style="margin:8px 0"><button class="btn btn-small" id="mem-load-members-btn">拉取群成员列表（编辑备注）</button><span id="mem-members-status" class="muted"></span></div><div id="mem-members"></div>`
-      : '';
-    const rows = members.map((m) => {
-      const who = notes[String(m.userId)] || m.name || m.userId || '某人';
-      const qq = m.userId ? ` <span class="muted">(QQ ${esc(m.userId)})</span>` : '';
-      const imps = m.impressions.map((e) => `- ${e.content}`).join('\n');
-      return `<div class="collapsible" open>
-        <summary>${esc(who)}${qq}（${m.impressions.length} 条）
-          <button class="btn btn-small mem-edit-imp" data-qq="${esc(m.userId)}" data-name="${esc(m.name)}" style="margin-left:8px">编辑</button>
-          <button class="btn btn-small mem-refresh-imp" data-qq="${esc(m.userId)}" data-name="${esc(m.name)}" style="margin-left:6px" title="让模型重新分析这个人：有印象则整理合并，没印象则从聊天记录里提炼">更新记忆</button>
-        </summary>
-        <div class="coll-body">${esc(imps)}</div>
-      </div>`;
-    }).join('');
-    // 整理状态从 state 恢复：切页签回来 / 刷新页面后依然可见
-    const busy = !!state.consolidating[chatKey];
-    const result = state.consolidateResult[chatKey];
-    let consolidateStatusHtml = '';
-    if (busy) {
-      const started = state.consolidating[chatKey]?.startedAt || Date.now();
-      const sec = Math.max(0, Math.round((Date.now() - started) / 1000));
-      consolidateStatusHtml = `<span id="mem-consolidate-status" class="muted">整理中…（已 ${sec}s）</span>`;
-    } else if (result) {
-      const ago = Math.max(0, Math.round((Date.now() - (result.at || 0)) / 1000));
-      const when = ago < 60 ? `${ago}s 前` : `${Math.round(ago / 60)} 分钟前`;
-      consolidateStatusHtml = `<span id="mem-consolidate-status" class="muted">${esc(result.note)}（${when}）</span>`;
-    } else {
-      consolidateStatusHtml = `<span id="mem-consolidate-status" class="muted"></span>`;
-    }
-    detail.innerHTML = `
-      <div class="detail-header">
-        <h2>${esc(formatChatTitle(chatKey, chatNameOf(chatKey)))} 的记忆</h2>
-        <div class="sub">
-          <span>每个群友一个文件：data/memory/${esc(chatKey.replace(':', '_'))}/&lt;QQ&gt;.json</span>
-          <button class="btn btn-small" id="mem-add-imp-btn">＋ 添加印象</button>
-          <button class="btn btn-small" id="mem-consolidate-btn" ${busy ? 'disabled' : ''}>${busy ? '整理中…' : '整理本群记忆'}</button>
-          ${consolidateStatusHtml}
-        </div>
-      </div>
-      ${membersHtml}
-      ${rows || '<div class="muted" style="padding:10px">还没有任何群友印象（可点右上角「＋ 添加印象」手动记，或点「整理本群记忆」让模型从聊天记录里提炼）。</div>'}
-    `;
-    const loadMembersBtn = $('#mem-load-members-btn');
-    if (loadMembersBtn) loadMembersBtn.addEventListener('click', () => loadGroupMembers(chatId, chatKey));
-    $$('.mem-edit-imp', detail).forEach((el) => {
-      el.addEventListener('click', (e) => {
-        e.preventDefault();
-        e.stopPropagation();
-        const m = members.find((x) => String(x.userId) === String(el.dataset.qq));
-        openMemberImpressModal(chatKey, m || { userId: el.dataset.qq, name: el.dataset.name, impressions: [] });
-      });
-    });
-    $('#mem-add-imp-btn')?.addEventListener('click', () => openMemberImpressModal(chatKey, null));
-    // 针对单个群友更新记忆：有印象→整理合并；无印象→从聊天记录提炼
-    $$('.mem-refresh-imp', detail).forEach((el) => {
-      el.addEventListener('click', async (e) => {
-        e.preventDefault();
-        e.stopPropagation();
-        const uid = String(el.dataset.qq || '').trim();
-        if (!/^\d{1,15}$/.test(uid)) { alert('该群友缺少 QQ 号，无法定位聊天记录'); return; }
-        el.disabled = true;
-        const old = el.textContent;
-        el.textContent = '更新中…';
-        // 同样记进 state，切页签回来后仍能看到进行中
-        state.consolidating[chatKey] = { startedAt: Date.now() };
-        delete state.consolidateResult[chatKey];
-        startConsolidateTicker();
-        renderMemoryList();
-        try {
-          await api('/api/memory-files/consolidate', {
-            method: 'POST',
-            body: JSON.stringify({ chatKey, userIds: [uid] })
-          });
-          el.textContent = '已提交 ✓';
-        } catch (err) {
-          el.textContent = '失败';
-          alert(`更新记忆失败：${err.message}`);
-        }
-        setTimeout(() => { el.disabled = false; el.textContent = old; }, 2500);
-      });
-    });
+    if (state.currentMemoryChatKey !== key) return;
+    let records = data.records || [];
+    if (key === 'events') records = records.filter((r) => ['event','commitment'].includes(r.kind));
+    const p = personData?.person;
+    const title = p ? (state.config?.memberNotes?.[p.userId] || p.name || p.userId || '待确认身份') : isChat ? formatChatTitle(key, chatNameOf(key)) : '事件与承诺';
+    const busy = !!state.consolidating[key];
+    const job = chatData?.job;
+    const personInfo = p ? '<div class="hint">' + esc(p.userId ? '统一身份：QQ ' + p.userId : '旧记录缺少 QQ 号，可编辑条目确认主体') + '<br>曾用称呼：' + esc(p.aliases.map((a) => a.name + '（' + a.chatKey + '）').join('、') || '无') + '</div>' : '';
+    detail.innerHTML = '<div class="detail-header"><h2>' + esc(title) + '</h2>' + personInfo + '<div class="sub"><button class="btn btn-small" id="mem-add-record">＋ 添加记忆</button>' +
+      (isChat ? '<button class="btn btn-small" id="mem-consolidate-btn" ' + (busy ? 'disabled' : '') + '>处理下一批新消息</button><span id="mem-consolidate-status" class="muted">' + esc(busy ? '处理中…' : state.consolidateResult[key]?.note || '') + '</span>' : '') + '</div>' +
+      (job ? '<div class="hint">已处理至本地消息 ' + job.cursor + ' · 上次成功 ' + fmtTime(job.lastSuccessAt) + ' · 记忆模型 ' + (job.usage?.calls || 0) + ' 次 / ' + (job.usage?.totalTokens || 0) + ' tok' + (job.lastError ? '<br>上次失败：' + esc(job.lastError) + '（原进度已保留，可重试）' : '') + '</div>' : '') +
+      (isChat && key.startsWith('group:') ? '<div class="field"><button class="btn btn-small" id="mem-load-members-btn">群成员与备注</button><span id="mem-members-status" class="muted"></span><div id="mem-members"></div></div>' : '') + '<div class="field-row"><select id="mem-kind-filter"><option value="">全部类型</option>' + Object.entries(memoryKinds).map(([v,l]) => '<option value="'+v+'">'+l+'</option>').join('') + '</select><label><input id="mem-history-toggle" type="checkbox"> 显示已删除／已替代／已过期</label></div></div><div id="mem-record-rows"></div>';
+    const paint = () => {
+      const showOld = $('#mem-history-toggle').checked, kind = $('#mem-kind-filter').value;
+      const shown = records.filter((r) => (!kind || r.kind === kind) && (showOld || (!['deleted','superseded','expired'].includes(r.status) && (!r.expiresAt || r.expiresAt > Date.now()))));
+      $('#mem-record-rows').innerHTML = shown.map((r) => {
+        const sources = r.sources.map((a) => '<div style="margin:8px 0"><b>' + esc(a.chatKey + ' · QQ ' + a.senderId + ' · 消息 ' + a.messageId) + '</b> · ' + fmtTime(a.ts) + '<div style="white-space:pre-wrap">' + esc(a.text) + '</div></div>').join('');
+        const history = r.history.map((h) => '<div style="margin:8px 0">v' + h.version + ' · ' + esc(memoryStatuses[h.status]) + ' · ' + esc(memoryScopeLabel(h)) + ' · ' + fmtTime(h.changedAt) + '<div style="white-space:pre-wrap">' + esc(h.content) + '</div></div>').join('');
+        const linked = records.filter((x) => x.eventId === r.id && x.status !== 'deleted').map((x) => x.content).join('；');
+        return '<details class="collapsible" open><summary>' + esc((r.pinned ? '📌 ' : '') + (r.title || memoryKinds[r.kind])) + ' <span class="muted">' + esc(memoryStatuses[r.status]) + ' · v' + r.version + '</span> ' + (r.status !== 'deleted' ? '<button class="btn btn-small mem-edit-record" data-id="'+esc(r.id)+'">编辑</button>' : '') + '</summary><div class="coll-body"><div style="white-space:pre-wrap">' + esc(r.content) + '</div><div class="hint">主体：' + esc(r.subjectIds.map((id) => id.replace(/^qq:/, 'QQ ')).join('、')) + '<br>范围：' + esc(memoryScopeLabel(r)) + ' · ' + esc(memoryEvidence[r.evidence]) + (r.expiresAt ? ' · 到期 '+fmtTime(r.expiresAt) : '') + '</div>' + (linked ? '<div>关联记忆：' + esc(linked) + '</div>' : '') + '<details><summary>来源与变更（' + r.sources.length + ' 条来源，' + r.history.length + ' 次变更）</summary>' + (sources || '<div class="muted">' + esc(r.legacySource ? '历史来源：'+r.legacySource.file+'；没有原始消息证据' : '人工添加或旧式工具写入，无原始消息证据') + '</div>') + history + '</details></div></details>';
+      }).join('') || '<div class="empty-hint">没有符合条件的记忆</div>';
+      $$('.mem-edit-record', detail).forEach((b) => b.addEventListener('click', (e) => { e.preventDefault(); openMemoryRecordModal(key, records.find((r) => r.id === b.dataset.id)); }));
+    };
+    $('#mem-kind-filter').addEventListener('change', paint); $('#mem-history-toggle').addEventListener('change', paint); paint();
+    $('#mem-add-record').addEventListener('click', () => openMemoryRecordModal(key));
+    $('#mem-load-members-btn')?.addEventListener('click', () => loadGroupMembers(key.split(':')[1], key));
     $('#mem-consolidate-btn')?.addEventListener('click', async () => {
-      const btn = $('#mem-consolidate-btn');
-      const status = $('#mem-consolidate-status');
-      // 立刻记进 state：即使马上切走页签，回来也能看到"整理中"
-      state.consolidating[chatKey] = { startedAt: Date.now() };
-      delete state.consolidateResult[chatKey];
-      startConsolidateTicker();
-      renderMemoryList();
-      if (btn) { btn.disabled = true; btn.textContent = '整理中…'; }
-      if (status) status.textContent = '整理中…';
-      try {
-        const r = await api('/api/memory-files/consolidate', {
-          method: 'POST',
-          body: JSON.stringify({ chatKey })
-        });
-        if (r.error) {
-          delete state.consolidating[chatKey];
-          state.consolidateResult[chatKey] = { note: `失败：${r.error}`, at: Date.now(), failed: true };
-          if (status) status.textContent = `失败：${r.error}`;
-          if (btn) { btn.disabled = false; btn.textContent = '整理本群记忆'; }
-          renderMemoryList();
-        }
-        // 成功时保持"整理中"，等 SSE 的 consolidate-done 事件来收尾
-      } catch (e) {
-        delete state.consolidating[chatKey];
-        state.consolidateResult[chatKey] = { note: `失败：${e.message}`, at: Date.now(), failed: true };
-        if (status) status.textContent = `失败：${e.message}`;
-        if (btn) { btn.disabled = false; btn.textContent = '整理本群记忆'; }
-        renderMemoryList();
-      }
+      const b = $('#mem-consolidate-btn'); b.disabled = true;
+      try { await api('/api/memory-files/consolidate', { method:'POST', body: JSON.stringify({ chatKey:key }) }); }
+      catch (e) { alert(e.message); b.disabled = false; }
     });
-    // 若本群正在整理，启动计时刷新（切回来时也能接着走）
-    if (state.consolidating[chatKey]) startConsolidateTicker();
-  } catch (e) {
-    detail.innerHTML = `<div class="empty-hint">加载失败：${esc(e.message)}</div>`;
-  }
+    if (busy) startConsolidateTicker();
+  } catch (e) { detail.innerHTML = '<div class="empty-hint">加载失败：'+esc(e.message)+'</div>'; }
 }
 
-/** 编辑/添加某个群友的印象（一行一条，保存后整体替换）。 */
-function openMemberImpressModal(chatKey, member) {
-  const isEdit = !!(member && member.userId);
-  const userId = member?.userId || '';
-  const name = member?.name || '';
-  const imps = (member?.impressions || []).map((e) => e.content).join('\n');
-  const cfg = state.config || {};
-  const notes = cfg.memberNotes || {};
-  const note = notes[String(userId)] || '';
-  const overlay = modelModalShell({
-    head: isEdit ? `编辑群友印象：${note || name || userId}` : '添加群友印象',
-    body: `
-      ${isEdit ? `
-      <div class="field-row">
-        <div class="field"><label>QQ 号</label><input type="text" id="mi-qq" value="${esc(userId)}" readonly /></div>
-        <div class="field"><label>QQ 昵称</label><input type="text" id="mi-nickname" value="${esc(name)}" readonly /></div>
-        <div class="field"><label>群内昵称</label><input type="text" id="mi-card" value="${esc(member?.card || '')}" readonly /></div>
-      </div>
-      <div class="field"><label>QQ agent 对群友的当前备注</label><input type="text" id="mi-note" value="${esc(note)}" placeholder="留空则使用原群名片/昵称" /></div>` : `
-      <div class="field"><label>QQ 号（必填）</label><input type="text" id="mi-qq" value="${esc(userId)}" /></div>
-      <div class="field"><label>名字（备注名/群名片/昵称）</label><input type="text" id="mi-name" value="${esc(name)}" /></div>`}
-      <div class="field"><label>印象内容（一行一条；留空 = 删除该成员全部印象）</label><textarea id="mi-imps" style="min-height:160px" placeholder="老王喜欢钓鱼，周末常不在&#10;说话爱玩梗，别太认真">${esc(imps)}</textarea></div>`,
-    foot: `<button class="btn" id="mi-cancel">取消</button>
-           ${isEdit ? '<button class="btn btn-danger" id="mi-del">删除此人</button>' : ''}
-           <button class="btn btn-primary" id="mi-save">保存</button>`
-  });
-  overlay.querySelector('#mi-cancel').addEventListener('click', () => closeModelModal(overlay));
-  overlay.querySelector('#mi-save').addEventListener('click', async () => {
-    const qq = ($('#mi-qq')?.value || '').trim();
-    const nm = ($('#mi-name')?.value || $('#mi-nickname')?.value || '').trim();
-    const newNote = ($('#mi-note')?.value || '').trim();
-    const lines = ($('#mi-imps')?.value || '').split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
-    if (!/^\d{1,15}$/.test(qq)) { alert('QQ 号必须是数字'); return; }
+function openMemoryRecordModal(key, record = null) {
+  const r = record || { kind: key === 'events' ? 'event' : 'fact', status:'active', content:'', title:'', subjectIds: key.startsWith('person:') ? [key.slice(7)] : [], visibility:{type:'chats',chatKeys:/^(group|private):\d+$/.test(key) ? [key] : []} };
+  const opts = (map, selected) => Object.entries(map).map(([v,l]) => '<option value="'+v+'" '+(v===selected?'selected':'')+'>'+l+'</option>').join('');
+  const eventOptions = (state.allMemoryRecords || []).filter((e) => ['event','commitment'].includes(e.kind) && !['deleted','superseded','expired'].includes(e.status) && e.id !== r.id);
+  const overlay = modelModalShell({ head: record ? '编辑记忆' : '添加记忆',
+    body: '<div class="field-row"><div class="field"><label>类型</label><select id="mr-kind">'+opts(memoryKinds,r.kind)+'</select></div><div class="field"><label>状态</label><select id="mr-status">'+opts(Object.fromEntries(Object.entries(memoryStatuses).filter(([k])=>k!=='deleted')),r.status)+'</select></div></div>'+
+      '<div class="field"><label>涉及的 QQ 号（逗号分隔；机器人填 bot）</label><input id="mr-subjects" value="'+esc(r.subjectIds.map((x)=>x.replace(/^qq:/,'')).join(','))+'"></div>'+
+      '<div class="field"><label>标题（事件或承诺）</label><input id="mr-title" value="'+esc(r.title||'')+'"></div>'+
+      '<div class="field"><label>内容</label><textarea id="mr-content" maxlength="2000" style="min-height:140px">'+esc(r.content)+'</textarea></div>'+
+      '<div class="field"><label>可见范围</label><select id="mr-scope"><option value="chats" '+(r.visibility.type==='chats'?'selected':'')+'>指定会话</option><option value="global" '+(r.visibility.type==='global'?'selected':'')+'>全局</option></select><input id="mr-chats" placeholder="例如 group:123,private:456" value="'+esc(r.visibility.chatKeys.join(','))+'"><div class="hint">私聊和群聊记录默认保持在来源会话内。选择全局后可跨会话使用。</div></div>'+
+      '<div class="field"><label>关联事件（可选）</label><select id="mr-event"><option value="">无</option>'+eventOptions.map((e)=>'<option value="'+esc(e.id)+'" '+(e.id===r.eventId?'selected':'')+'>'+esc(e.title||e.content.slice(0,50))+'</option>').join('')+'</select></div>'+
+      '<div class="field"><label>过期时间（可选，本地时间）</label><input id="mr-expires" type="datetime-local"></div>'+
+      '<label><input id="mr-pinned" type="checkbox" '+(r.pinned?'checked':'')+'> 固定：仅管理员可以修改</label><div id="mr-error" class="hint"></div>',
+    foot:'<button class="btn" id="mr-cancel">取消</button>'+(record?'<button class="btn btn-danger" id="mr-delete">删除</button>':'')+'<button class="btn btn-primary" id="mr-save">保存</button>' });
+  const q = (sel)=>overlay.querySelector(sel);
+  const syncScope = ()=>{q('#mr-chats').disabled=q('#mr-scope').value==='global';};
+  q('#mr-scope').addEventListener('change',syncScope); syncScope();
+  if (r.expiresAt) { const d=new Date(r.expiresAt); q('#mr-expires').value=new Date(d.getTime()-d.getTimezoneOffset()*60000).toISOString().slice(0,16); }
+  q('#mr-cancel').addEventListener('click',()=>closeModelModal(overlay));
+  const submit = async (remove=false)=>{
+    q('#mr-save').disabled=true;
     try {
-      await api(`/api/memory-files/${chatKey.replace(':', '_')}/members/${qq}`, {
-        method: 'PUT',
-        body: JSON.stringify({ name: nm, note: newNote, impressions: lines })
-      });
-      closeModelModal(overlay);
-      loadMemoryDetail(chatKey);
-    } catch (e) {
-      alert(`保存失败：${e.message}`);
-    }
-  });
-  const delBtn = overlay.querySelector('#mi-del');
-  if (delBtn) delBtn.addEventListener('click', async () => {
-    if (!confirm(`确定删除 ${note || name || userId} 的全部印象？`)) return;
-    try {
-      await api(`/api/memory-files/${chatKey.replace(':', '_')}/members/${userId}`, { method: 'DELETE', body: '{}' });
-      closeModelModal(overlay);
-      loadMemoryDetail(chatKey);
-    } catch (e) {
-      alert(`删除失败：${e.message}`);
-    }
-  });
+      const body = remove ? { expectedVersion:r.version } : { expectedVersion:r.version, kind:q('#mr-kind').value, status:q('#mr-status').value,
+        subjectIds:q('#mr-subjects').value.split(/[,，\s]+/).filter(Boolean), content:q('#mr-content').value, title:q('#mr-title').value,
+        visibility:{type:q('#mr-scope').value,chatKeys:q('#mr-chats').value.split(/[,，\s]+/).filter(Boolean)},
+        pinned:q('#mr-pinned').checked, eventId:q('#mr-event').value||null, expiresAt:q('#mr-expires').value?new Date(q('#mr-expires').value).getTime():null };
+      await api('/api/memory/records'+(record?'/'+r.id:''),{method:remove?'DELETE':record?'PUT':'POST',body:JSON.stringify(body)});
+      closeModelModal(overlay); await loadMemoryView();
+    } catch(e) {q('#mr-error').textContent=e.message; q('#mr-save').disabled=false;}
+  };
+  q('#mr-save').addEventListener('click',()=>submit());
+  if(record) q('#mr-delete').addEventListener('click',()=>{if(confirm('删除这条记忆？历史记录仍可在“显示已删除”中查看。'))submit(true);});
 }
 
 async function loadGroupMembers(chatId, chatKey) {
@@ -3070,7 +2942,7 @@ function renderMemorySettingsSection(c) {
   return `
     <h3 id="settings-memory">记忆整理</h3>
     <div class="checkbox-row"><input type="checkbox" id="cfg-mem-consolidate" ${mem.consolidateEnabled !== false ? 'checked' : ''} />
-      <label for="cfg-mem-consolidate">启用记忆自动整理</label></div>
+      <label for="cfg-mem-consolidate">启用新消息自动提取记忆</label></div>
     <div class="checkbox-row"><input type="checkbox" id="cfg-mem-usechat" ${useChat ? 'checked' : ''} />
       <label for="cfg-mem-usechat">使用与聊天机器人相同的模型</label></div>
     <div id="mem-model-box" style="${useChat ? 'display:none' : ''}">
@@ -3083,8 +2955,8 @@ function renderMemorySettingsSection(c) {
         <input type="hidden" id="cfg-mem-model" value="${esc(mem.model || '')}" />
       </div>
     </div>
-    <div class="field"><label>整理冷却时间（毫秒）</label><input type="number" id="cfg-mem-interval" min="1800000" step="600000" value="${esc(mem.consolidateMinIntervalMs ?? 21600000)}" /></div>
-    <div class="hint">条数超过阈值且距上次整理超过该冷却时间后，才会在运行结束后后台整理。默认 6 小时（21600000 毫秒）。</div>`;
+    <div class="field"><label>新消息处理间隔（毫秒）</label><input type="number" id="cfg-mem-interval" min="1000" step="1000" value="${esc(mem.extractionIntervalMs ?? 60000)}" /></div>
+    <div class="hint">默认每 60 秒处理一批新消息，不依赖机器人是否回复。失败会保留进度并重试；历史积压按批处理。会产生额外模型用量。</div>`;
 }
 
 function renderPersonaSection(c) {
@@ -4600,7 +4472,7 @@ async function saveConfig({ quiet = false } = {}) {
       useChatModel: chk('#cfg-mem-usechat', c.memory?.useChatModel !== false),
       provider: val('#cfg-mem-provider', c.memory?.provider || '').trim(),
       model: val('#cfg-mem-model', c.memory?.model || '').trim(),
-      consolidateMinIntervalMs: Number(val('#cfg-mem-interval', c.memory?.consolidateMinIntervalMs ?? 21600000)) || 21600000
+      extractionIntervalMs: Number(val('#cfg-mem-interval', c.memory?.extractionIntervalMs ?? 60000)) || 60000
     };
   }
 

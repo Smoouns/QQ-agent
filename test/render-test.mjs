@@ -90,7 +90,7 @@ const sandbox = {
   matchMedia: () => ({ matches: false, addEventListener() {}, addListener() {} }),
   navigator: { userAgent: 'node', clipboard: { writeText: async () => {} } },
   requestAnimationFrame: (fn) => setTimeout(fn, 0),
-  URL, Blob: function () {}, FileReader: function () {},
+  URL, URLSearchParams, Blob: function () {}, FileReader: function () {},
   Intl, Math, JSON, Date, Number, String, Object, Array, Map, Set, Boolean, RegExp, Error,
   isNaN, parseInt, parseFloat, encodeURIComponent, decodeURIComponent,
   structuredClone: (x) => JSON.parse(JSON.stringify(x))
@@ -346,6 +346,11 @@ try {
         const REAL_USAGE_APIS = ['/api/usage/stats', '/api/usage/breakdown', '/api/status'];
         sandbox.fetch = async (url) => {
           const u = String(url);
+          // Background initialization may finish while this section is running.
+          // Explicitly stub its real endpoints; unknown usage endpoints still fail.
+          const background = { '/api/config': DC2, '/api/chats': { chats: [] }, '/api/sessions': { sessions: [] },
+            '/api/memory-files': { files: [] }, '/api/memory/persons': { persons: [] }, '/api/memory/records': { records: [] } };
+          if (Object.hasOwn(background, u.split('?')[0])) return { ok: true, status: 200, json: async () => background[u.split('?')[0]] };
           const hit = REAL_USAGE_APIS.find((p) => u.includes(p));
           if (!hit) return { ok: false, status: 404, json: async () => ({ error: `未知 API：${u}` }) };
           const body = u.includes('/api/usage/stats') ? stats : statusData;
@@ -546,6 +551,35 @@ try {
     console.log('  ' + (okPh ? 'OK   ' : 'FAIL ') + '官方价仍在占位符与悬停提示里' + (okPh ? '' : ' -> ' + rightHtml.slice(0, 150)));
   } catch (e) {
     fail++; console.log('  FAIL 批量价格弹窗抛错: ' + (e && e.message));
+  }
+
+  console.log('\n=== 记忆人物、事件和管理表单 ===');
+  {
+    const oldFetch = sandbox.fetch;
+    const record = { id: 'm_fixture', kind: 'event', title: '共同活动', content: '<script>unsafe</script>', subjectIds: ['qq:123', 'qq:456'],
+      visibility: { type: 'chats', chatKeys: ['group:1'] }, status: 'pending', evidence: 'explicit', version: 2,
+      sources: [{ chatKey: 'group:1', senderId: '123', messageId: 1, ts: 10, text: '来源摘录' }],
+      history: [{ version: 1, content: '旧内容', visibility: { type: 'chats', chatKeys: ['group:1'] }, status: 'active', changedAt: 20 }] };
+    sandbox.fetch = async (url) => ({ ok: true, json: async () => String(url).includes('/persons/')
+      ? { person: { id: 'qq:123', userId: '123', name: '明', aliases: [{ name: '老明', chatKey: 'group:2' }] } }
+      : String(url).includes('/memory-files/') ? { job: { cursor: 12, usage: { calls: 3, totalTokens: 120 } } } : { records: [record] } });
+    try {
+      vm.runInContext("state.currentMemoryChatKey = 'person:qq:123';", ctx);
+      await ctx.loadMemoryDetail('person:qq:123');
+      const personHtml = document.querySelector('#memory-detail').innerHTML;
+      const rows = document.querySelector('#mem-record-rows').innerHTML;
+      const ok = personHtml.includes('统一身份：QQ 123') && personHtml.includes('老明（group:2）') && rows.includes('来源摘录') && rows.includes('旧内容') && rows.includes('&lt;script&gt;') && !rows.includes('<script>');
+      ok ? pass++ : fail++; console.log('  '+(ok?'OK   ':'FAIL ')+'人物聚合、来源、历史与 HTML 转义');
+      vm.runInContext("state.currentMemoryChatKey = 'group:1';", ctx);
+      await ctx.loadMemoryDetail('group:1');
+      const chatHtml = document.querySelector('#memory-detail').innerHTML;
+      const chatOk = chatHtml.includes('处理下一批新消息') && chatHtml.includes('群成员与备注') && chatHtml.includes('120 tok');
+      chatOk ? pass++ : fail++; console.log('  '+(chatOk?'OK   ':'FAIL ')+'会话增量入口、备注功能与记忆用量');
+      ctx.openMemoryRecordModal('group:1', record);
+      const modal = document.body.children.at(-1).innerHTML;
+      const formOk = modal.includes('mr-pinned') && modal.includes('mr-scope') && modal.includes('mr-status') && modal.includes('mr-subjects');
+      formOk ? pass++ : fail++; console.log('  '+(formOk?'OK   ':'FAIL ')+'逐条管理表单包含固定、范围、状态与多主体');
+    } finally { sandbox.fetch = oldFetch; }
   }
 
 } catch (e) {

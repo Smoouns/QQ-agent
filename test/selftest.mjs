@@ -289,6 +289,7 @@ refs:
     maxConcurrentRuns: 2,
     send: { minGapMs: 10, maxGapMs: 20, byLengthMs: 0, maxPerMinute: 100, maxPerHour: 1000, hardSplitAt: 4000 },
     proactive: { enabled: false },
+    memory: { consolidateEnabled: false },
     sticker: { enabled: true, collectEnabled: true },
     store: { maxMessagesPerChat: 0, pastStateLimit: 80, pastStateMaxChars: 6000, keepSessionFiles: 100 },
     server: { port: await freePort(), token: '' }
@@ -771,52 +772,26 @@ refs:
   assert.ok((await uiRes.text()).includes('QQ Agent'), 'UI 首页可访问');
   pass('HTTP API：status/models/sessions/chats/UI 全部可用', `今日 ${statusRes.usage.totalTokens} tok`);
 
-  // ── 场景 26：群友印象手动整理（逐成员整理 + 按聊天记录过滤 + 备份）──
-  let i = 0;
-  while (app.memory.consolidationState('group:456').counts.memberImpression <= 8) {
-    app.memory.append('group:456', 'memberImpression', `对114的第${++i}条印象——测试整理用的独特内容`, { userId: '114', target: '114' });
-  }
-  assert.ok(app.memory.consolidationState('group:456').counts.memberImpression > 8, '印象已灌到超阈值');
-  // 手动整理：模拟 114 在聊天记录里出现 3 次以上
-  app.store.appendIncoming('group:456', { mid: 9101, ts: Date.now() - 3000, senderId: '114', senderName: '114', text: '手动整理测试1' });
-  app.store.appendIncoming('group:456', { mid: 9102, ts: Date.now() - 2000, senderId: '114', senderName: '114', text: '手动整理测试2' });
-  app.store.appendIncoming('group:456', { mid: 9103, ts: Date.now() - 1000, senderId: '114', senderName: '114', text: '手动整理测试3' });
-  llm.state.script.push(
-    { content: JSON.stringify({ impressions: ['合并后的综合印象（来自整理测试）'] }) },
-    // 111 也会被整理，补一条脚本，避免它吃到"默认：无动作"而产生解析噪音
-    { content: JSON.stringify({ impressions: ['合并后的综合印象（111）'] }) }
-  );
-  const consResp = await fetch(`http://127.0.0.1:${cfg.server.port}/api/memory-files/consolidate`, {
-    method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ chatKey: 'group:456' })
-  });
-  const consJson = await consResp.json();
-  assert.strictEqual(consJson.ok, true, `手动整理接口已启动（响应：${JSON.stringify(consJson)}）`);
-  await waitFor(() => app.memory.getMember('group:456', '114').impressions.length === 1, 10000, '群友印象手动整理完成');
-  const memAfter = app.memory.query('group:456');
-  assert.ok(String(memAfter.memberImpression[0].content).includes('合并后的综合印象'), '整理结果写回存储');
-  const backupDir = path.join(dataDir, 'memory', 'backups', 'group_456');
-  assert.ok(fs.existsSync(path.join(backupDir, '114.json')), '整理前原印象已备份到会话文件夹备份');
-  pass('群友印象手动整理：逐成员整理 + 写回 + 备份');
-
-  // 冷却验证：断言没有"额外的"自动整理被触发。
-  // 注意：手动整理本身会因「发现新人」额外调用若干次模型（同一次任务内部，属正常），
-  // 所以要先等计数稳定再取基线，否则会把整理内部的调用误判成"自动整理又跑了一次"。
-  const consCount = () => llm.state.requests.filter((r) => String(r.messages?.[0]?.content || '').includes('记忆整理模块')).length;
-  const settle = async () => {
-    let prev = -1;
-    for (let i = 0; i < 40; i++) {
-      const now = consCount();
-      if (now === prev) return now;
-      prev = now;
-      await sleep(500);
-    }
-    return consCount();
-  };
-  const consBefore = await settle();
-  await sleep(1500);
-  assert.strictEqual(consCount(), consBefore, '手动整理后无多余自动整理请求');
-  pass('群友印象整理冷却：冷却期内不重复触发');
+  // ── 场景 26：独立游标与有来源的事件写入 ──
+  const previous = app.store.recent('group:456', {limit:10000});
+  app.memory.commitExtraction('group:456', previous, [], {cursor:0});
+  const memoryMessage = app.store.appendIncoming('group:456', {mid:9101, senderId:'114',senderName:'114',text:'我周六会整理群活动资料'});
+  const beforeFacts = app.memory.query('group:456').memberImpression.length;
+  llm.state.script.push({content:JSON.stringify({memories:[{kind:'commitment',content:'114 答应周六整理群活动资料',subjectIds:['114'],sourceMessageIds:[memoryMessage.id],evidence:'explicit',status:'pending',title:'群活动资料'}]})});
+  const consResp = await fetch(`http://127.0.0.1:${cfg.server.port}/api/memory-files/consolidate`,{
+    method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({chatKey:'group:456'})});
+  assert.equal(consResp.status,202);
+  await waitFor(()=>app.memory.job('group:456').cursor===memoryMessage.id,10000,'增量记忆写入');
+  const savedMemory=app.memory.listRecords({chatKey:'group:456',kind:'commitment'})[0];
+  assert.equal(savedMemory.status,'pending');
+  assert.equal(savedMemory.sources[0].mid,9101);
+  assert.equal(app.memory.query('group:456').memberImpression.length,beforeFacts,'新事件不会压缩旧事实');
+  assert.equal(app.store.findByLocalId('group:456',memoryMessage.id).read,false,'记忆写入不改变聊天已读状态');
+  pass('记忆增量写入：来源、事件状态、独立游标与旧事实保留');
+  const countBefore=llm.state.requests.length;
+  await app.orchestrator.consolidateMemoryForChat('group:456');
+  assert.equal(llm.state.requests.length,countBefore,'没有新消息不重复请求模型');
+  pass('记忆幂等处理：没有新消息不重复抽取');
 
   // ── 场景 27：模型图片输入探测 + 按模型门控看图工具 ──
   // 先通过手动添加提供商 API 创建视觉探测专用提供商（baseUrl 指向 mock LLM）

@@ -200,6 +200,20 @@ export class ChatStore {
     return st.messages.find((m) => m.id === Number(localId)) || null;
   }
 
+  /** Independent memory cursor: never consumes or changes chat read state. */
+  after(chatKey, localId = 0, { limit = 80, maxChars = 18000 } = {}) {
+    const out = [];
+    let size = 0;
+    for (const m of this.#state(chatKey).messages) {
+      if (m.id <= localId) continue;
+      const n = Math.min(String(m.text || '').length, 4000);
+      if (out.length && (out.length >= limit || size + n > maxChars)) break;
+      out.push({ ...m, text: String(m.text || '').slice(0, 4000) });
+      size += n;
+    }
+    return out;
+  }
+
   /** 最近 senderId 出现过的活跃成员（带最后发言时间）。 */
   activeMembers(chatKey, limit = 10) {
     const st = this.#state(chatKey);

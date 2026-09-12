@@ -188,10 +188,12 @@ export const DEFAULT_CONFIG = {
   // 被屏蔽群员的消息在入口处直接丢弃——不存档、不触发会话、不作为提示词背景。
   // 机器人自己的消息不受影响。仅群聊有意义（私聊要屏蔽请直接用白名单/黑名单）。
   blocklist: {},
-  // 记忆自动整理：条数超阈值且距上次超过冷却时间时，在运行结束后后台合并/去重/删过时
+  // 记忆后台增量写入：独立游标、按批处理，不压缩删除旧事实。
   memory: {
     consolidateEnabled: true,
-    consolidateMinIntervalMs: 21600000,  // 默认 6 小时
+    extractionIntervalMs: 60000,          // 新消息增量抽取间隔；不依赖机器人是否回复
+    extractionBatchSize: 60,              // 每批上限；写入成功才推进独立游标
+    consolidateMinIntervalMs: 21600000,  // 旧版字段；v2 不再使用
     useChatModel: true,                   // true = 整理模型跟随聊天模型；false = 使用下方专用模型
     provider: '',                         // 专用模型所属提供商 id（useChatModel=false 时生效）
     model: ''                             // 专用模型 id（useChatModel=false 时生效）

@@ -373,18 +373,40 @@ export function buildToolDefs() {
     },
     {
       name: 'memory_append',
-      description: '记一条对群友的长期印象（下次运行会自动看到）。只记"以后和这个人打交道时用得上"的稳定印象：他的身份/关系、说话风格、爱玩的梗、雷点、常聊话题、别踩的坑。太临时的事情不要记。userId 必须填对方的 QQ 号（不知道就先调 get_active_members / get_recent_messages 查）；target 填备注名/群名片/昵称，用于展示。',
+      description: '保存事实、偏好、关系、共同事件或承诺，或按 targetId/targetVersion 更新已有记录。必须准确区分说话人与主体；多人事件只写一份。sourceMessageIds 填原始 QQ 消息 ID。记录仅限当前会话，固定记忆不可修改。未提供来源的旧式调用只保存为待核实的事实。',
       parameters: {
         type: 'object',
         properties: {
           category: { type: 'string', enum: ['memberImpression'] },
           userId: { type: ['integer', 'string'], description: '对方 QQ 号（数字）' },
           target: { type: 'string', description: '对方名字（备注名/群名片/昵称）' },
-          content: { type: 'string', description: '印象内容（≤120字，稳定、可跨多次聊天使用）' }
+          kind: { type: 'string', enum: ['fact', 'preference', 'interaction', 'relationship', 'event', 'commitment'] },
+          subjectIds: { type: 'array', items: { type: 'string' }, description: '涉及的 QQ 号，多人事件可填写多个；机器人用 bot' },
+          sourceMessageIds: { type: 'array', items: { type: ['integer', 'string'] }, description: '原始 QQ 消息 ID（聊天记录 #数字）' },
+          evidence: { type: 'string', enum: ['explicit', 'reported', 'inferred'] },
+          status: { type: 'string', enum: ['active', 'pending', 'in_progress', 'completed', 'cancelled', 'superseded', 'expired'] },
+          title: { type: 'string', description: '事件标题' },
+          targetId: { type: 'string', description: '更新已有记忆的 ID' },
+          targetVersion: { type: 'integer', description: '更新前的版本号' },
+          content: { type: 'string', description: '记忆内容或事件经过（最多2000字，准确、独立可理解）' }
         },
-        required: ['category', 'userId', 'content']
+        required: ['content']
       },
       async execute(ctx, args) {
+        if (Array.isArray(args.sourceMessageIds) && args.sourceMessageIds.length) {
+          try {
+            if (args.sourceMessageIds.some((id) => !/^-?\d+$/.test(String(id)))) return err('sourceMessageIds 必须是数字 QQ 消息 ID');
+            const messages = args.sourceMessageIds.map((id) => ctx.store.findByMid(ctx.chatKey, id));
+            if (messages.some((m) => !m)) return err('来源消息不存在于当前会话');
+            const result = ctx.memory.commitExtraction(ctx.chatKey, messages, [{ ...args, kind: args.kind || 'fact',
+              subjectIds: args.subjectIds || [String(args.userId || '')], evidence: args.evidence || 'inferred',
+              sourceMessageIds: messages.map((m) => m.id) }], { advance: false,
+              knownIds: ctx.store.activeMembers(ctx.chatKey, 300).map((p) => p.userId).filter((id) => /^\d{1,15}$/.test(id)) });
+            ctx.emit?.('memory-update', { chatKey: ctx.chatKey });
+            return ok({ saved: true, ...result });
+          } catch (error) { return err(error.message); }
+        }
+        if (args.targetId || (args.kind && args.kind !== 'fact') || args.subjectIds) return err('此类记忆必须提供 sourceMessageIds');
         const userId = String(args.userId ?? '').trim();
         if (!/^\d{1,15}$/.test(userId)) {
           return err(`userId 必须是数字 QQ 号（收到：${JSON.stringify(args.userId)}）。先用 get_active_members 查准确 QQ 号再记。`);
@@ -393,12 +415,13 @@ export function buildToolDefs() {
           userId,
           target: String(args.target ?? '').trim()
         });
+        ctx.emit?.('memory-update', { chatKey: ctx.chatKey });
         return ok({ saved: true, entry });
       }
     },
     {
       name: 'memory_query',
-      description: '查看当前会话里你对群友的长期印象。不传 userId 返回全部；传 userId 只看某一个人。',
+      description: '查看当前会话可见的记忆及其 ID、版本、状态，以便后续写入更新。可传 userId 按 QQ 号过滤；不包含其他群或私聊的专属记忆。',
       parameters: {
         type: 'object',
         properties: {
@@ -411,12 +434,14 @@ export function buildToolDefs() {
         const list = userId
           ? mem.memberImpression.filter((e) => String(e.userId) === userId)
           : mem.memberImpression;
-        return ok({ memberImpression: list });
+        const records = ctx.memory.listRecords({ chatKey: ctx.chatKey, personId: userId }).slice(0, 100)
+          .map(({ id, kind, content, subjectIds, status, version, pinned, title, evidence }) => ({ id, kind, content, subjectIds, status, version, pinned, title, evidence }));
+        return ok({ memberImpression: list, records });
       }
     },
     {
       name: 'memory_remove',
-      description: '删除一条过时/不再准确的对群友印象。userId 优先按 QQ 号删；target 按名字删；两者都不传则删全部印象。',
+      description: '将当前会话中某人的一条旧事实标记为被替代，保留历史。须同时提供准确 QQ 号和完整内容。不能改动全局、多人或固定记忆。',
       parameters: {
         type: 'object',
         properties: {
@@ -425,7 +450,7 @@ export function buildToolDefs() {
           target: { type: 'string', description: '对方名字（没有 QQ 号时用）' },
           content: { type: 'string', description: '可选：只删这条内容' }
         },
-        required: ['category']
+        required: ['category', 'userId', 'content']
       },
       async execute(ctx, args) {
         const removed = ctx.memory.remove(ctx.chatKey, 'memberImpression', {

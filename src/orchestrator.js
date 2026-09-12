@@ -16,6 +16,7 @@ import { chatCompletion, chatCompletionWithRetry, addUsage, isRetryableError } f
 import { buildToolDefs, toOpenAiTools, executeTool } from './tools.js';
 import { modelImageVerdict } from './vision-scan.js';
 import { currentProviders } from './providers.js';
+import { MemoryPipeline } from './memory-pipeline.js';
 
 export class Orchestrator {
   constructor({ store, memory, stickers, sender, sessions, onebot, emit = null, mcp = null }) {
@@ -41,6 +42,9 @@ export class Orchestrator {
     this.pauseReason = null;
     this.proactiveTimer = null;
     this.aborted = false;
+    this.memoryPipeline = new MemoryPipeline({ store, memory, busy: this.consolidating, emit: this.emit,
+      enabled: () => !this.paused && !this.aborted,
+      runModel: (messages) => this.#memoryChat(messages) });
   }
 
   /**
@@ -48,6 +52,7 @@ export class Orchestrator {
    * 如果模型未配置，wake 会自然跳过（消息保留未读，不丢失）。
    */
   drainBacklogAfterResume() {
+    this.memoryPipeline.resume();
     for (const chatKey of this.store.listChats()) {
       if (this.store.unreadCount(chatKey) > 0) this.scheduleWake(chatKey, 0);
     }
@@ -57,6 +62,7 @@ export class Orchestrator {
 
   /** 收到新消息（已通过白名单校验并写入 store）。 */
   onIncoming(chatKey) {
+    this.memoryPipeline.schedule(chatKey);
     if (this.paused || this.aborted) return;
     if (this.runningChats.has(chatKey)) return;   // 运行结束后 drain 会接管
     this.scheduleWake(chatKey);
@@ -370,7 +376,7 @@ export class Orchestrator {
     }
 
     // 记忆自动整理（后台静默，绝不阻塞/影响聊天主流程）
-    this.#maybeConsolidateMemory(chatKey);
+    this.memoryPipeline.schedule(chatKey);
   }
 
   /**
@@ -690,379 +696,12 @@ export class Orchestrator {
     return out;
   }
 
-  // ── 群友印象自动整理 ──
-  // 触发条件（二者同时满足）：印象条数超过阈值，且距上次整理超过冷却时间。
-  //
-  // 阈值原为硬编码 8，实测用户群里 5 位成员各 1 条印象（合计 5），5 > 8 恒 false
-  // → 自动整理永远不触发。改为可配置（config.memory.consolidateMinImpressions），
-  // 且默认值下调，避免在"人不多、印象还没攒起来"的群里彻底失灵。
-  static MEMORY_THRESHOLDS = { memberImpression: 4 };
-  static MEMBER_MIN_MESSAGES = 3;         // 整理条件：该群友在聊天记录里至少出现 3 条
-  static MEMBER_MIN_IMPRESSIONS = 1;      // 整理条件：至少有 1 条印象（旧数据也可整理）
-  // "发现新人"：批量整理时，聊天记录里发言够多但完全没有印象的人，也纳入整理（新建印象）。
-  // 否则记忆为空的群点整理会得到"没有可整理的群友"，功能对新群完全无效。
-  static DISCOVER_MIN_MESSAGES = 20;      // 至少发过这么多条才值得分析
-  static DISCOVER_MAX_MEMBERS = 3;        // 单次最多发现几个人（控制成本）
-
-  #maybeConsolidateMemory(chatKey) {
-    try {
-      const cfg = getConfig();
-      if (cfg.memory?.consolidateEnabled === false) return;
-      if (this.paused || this.aborted) return;
-      if (!cfg.api?.model || !cfg.api?.baseUrl) return;   // 没选模型就不整理
-      if (this.consolidating.has(chatKey)) return;
-      const st = this.memory.consolidationState(chatKey);
-      // 阈值可配置：config.memory.consolidateMinImpressions（默认取类常量）
-      // 注意：这里原先误写成裸标识符 T，运行时会抛 ReferenceError 导致自动整理彻底失效。
-      const minImpressions = Math.max(1,
-        Number(cfg.memory?.consolidateMinImpressions) || Orchestrator.MEMORY_THRESHOLDS.memberImpression);
-      // 触发条件二选一：
-      //   A. 全群印象总数超过阈值
-      //   B. 任一成员的印象条数超过上限
-      // 只看总数会在"人少"的群里彻底失灵 —— 比如 3 位成员各 1 条，
-      // 总数 3 永远够不到阈值，自动整理形同虚设。
-      const maxPerMember = Math.max(2, Number(cfg.memory?.maxImpressionsPerMember) || 5);
-      const anyMemberOverloaded = st.members.some((m) => m.count > maxPerMember);
-      if (!(st.counts.memberImpression > minImpressions) && !anyMemberOverloaded) return;
-      const minInterval = Math.max(30 * 60 * 1000, Number(cfg.memory?.consolidateMinIntervalMs) || 6 * 60 * 60 * 1000);
-      if (Date.now() - (st.lastConsolidatedAt || 0) < minInterval) return;
-      this.consolidating.add(chatKey);
-      this.consolidateMemoryForChat(chatKey)
-        .catch((error) => console.error(`[memory] 整理 ${chatKey} 失败:`, error?.message ?? error))
-        .finally(() => this.consolidating.delete(chatKey));
-    } catch { /* 整理是锦上添花，绝不影响聊天主流程 */ }
+  // ── 增量记忆写入（与聊天上下文/已读状态独立）──
+  /** Process the next unread-by-memory batch; chat read state is independent. */
+  async consolidateMemoryForChat(chatKey) {
+    return this.memoryPipeline.run(chatKey);
   }
 
-  /**
-   * 整理群友印象 —— 唯一入口。
-   * 手动按钮、自动整理、针对特定群友，三种用法都走这里，避免逻辑分叉走样。
-   *
-   * @param {string} chatKey  会话 key
-   * @param {object} [opts]
-   * @param {string[]} [opts.userIds]  只整理这些人（指定群友时用）；不传 = 按规则筛选全部
-   * @param {boolean} [opts.force]     跳过冷却/门槛检查（手动触发时用）
-   * @returns {Promise<{ok, note, changed, results, skipped, failed}>}
-   *
-   * 身份识别（"同一个人"的判定）：
-   *   1) 优先用记忆里的 userId（QQ 号）匹配聊天记录 senderId；
-   *   2) 匹配不到时，用备注名/记忆名反查 senderName，命中后把 QQ 号回写进记忆；
-   *   3) 仍匹配不到但有名字 → 允许整理（历史遗留的"按名字存"条目不能永远排队）；
-   *   4) 既无名也无号 → 跳过。
-   */
-  async consolidateMemoryForChat(chatKey, { userIds = null, force = false } = {}) {
-    const cfg = getConfig();
-    if (!cfg.api?.model || !cfg.api?.baseUrl) throw new Error('模型未配置，无法整理记忆');
-    const notes = cfg.memberNotes || {};
-    const only = Array.isArray(userIds) && userIds.length
-      ? new Set(userIds.map((u) => String(u ?? '').trim()).filter(Boolean))
-      : null;
-
-    const stats = this.#scanChatActivity(chatKey);
-    const existing = this.memory.members(chatKey);
-
-    // ── 选出要整理的人 ──
-    const targets = [];
-    const skipped = [];
-
-    // 指定群友但记忆里还没有 → 也要能"新建"印象（这是本功能的关键价值：
-    // 聊了 200 条却零印象的人，可以手动让他被分析一次）
-    if (only) {
-      for (const uid of only) {
-        const found = existing.find((m) => String(m.userId || '') === uid);
-        if (found) {
-          const resolved = this.#resolveIdentity(chatKey, found, stats, notes);
-          targets.push({ ...resolved, isNew: false });
-          continue;
-        }
-        // 记忆里没有这个人：用聊天记录里的名字兜底，允许新建
-        const name = stats.uidToName.get(uid) || notes[uid] || '';
-        if (!name && !stats.memberMsgCount.get(uid)) {
-          skipped.push({ userId: uid, name: '', reason: '聊天记录里没有此人发言' });
-          continue;
-        }
-        targets.push({
-          userId: uid,
-          name: name || `QQ ${uid}`,
-          impressions: [],
-          isNew: true
-        });
-      }
-    } else {
-      // 先整理记忆里已有的人
-      const knownUserIds = new Set();
-      for (const mem of existing) {
-        const resolved = this.#resolveIdentity(chatKey, mem, stats, notes);
-        if (String(resolved.userId || '')) knownUserIds.add(String(resolved.userId));
-        if (this.#shouldSkip(resolved, force)) {
-          skipped.push({
-            userId: resolved.userId,
-            name: resolved.name,
-            reason: this.#skipReason(resolved)
-          });
-          continue;
-        }
-        targets.push({ ...resolved, isNew: false });
-      }
-
-      // 再"发现"聊天记录里的活跃群友：他们发言很多却没有任何印象。
-      // 没有这一步，记忆为空的群（如刚启用记忆的群）点整理只会得到
-      // "没有可整理的群友"，功能形同虚设。
-      const discoverMin = Math.max(1,
-        Number(cfg.memory?.discoverMinMessages) || Orchestrator.DISCOVER_MIN_MESSAGES);
-      const discoverMax = Math.max(1,
-        Number(cfg.memory?.discoverMaxMembers) || Orchestrator.DISCOVER_MAX_MEMBERS);
-      const discovered = [...stats.memberMsgCount.entries()]
-        .filter(([uid, n]) => n >= discoverMin && !knownUserIds.has(uid))
-        .sort((a, b) => b[1] - a[1])
-        .slice(0, discoverMax);
-      for (const [uid, n] of discovered) {
-        targets.push({
-          userId: uid,
-          name: stats.uidToName.get(uid) || notes[uid] || `QQ ${uid}`,
-          impressions: [],
-          isNew: true,
-          discoveredFrom: n
-        });
-      }
-    }
-
-    const skippedNote = skipped.length
-      ? `（跳过 ${skipped.length} 位：${skipped.slice(0, 3).map((s) => `${s.name || s.userId} ${s.reason}`).join('；')}${skipped.length > 3 ? ' 等' : ''}）`
-      : '';
-
-    if (!targets.length) {
-      return {
-        ok: true,
-        note: `没有可整理的群友${skippedNote || (only ? '（未指定有效群友）' : '（该群还没有任何群友印象，且聊天记录里没有发言足够多的活跃成员）')}`,
-        changed: 0,
-        results: [],
-        skipped,
-        failed: []
-      };
-    }
-
-    // ── 逐个整理 ──
-    const results = [];
-    const failed = [];
-    let changed = 0;
-
-    for (const mem of targets) {
-      if (this.aborted) break;
-      const before = mem.impressions.map((e) => e.content);
-      try {
-        const next = await this.#consolidateOneMember(chatKey, mem, { force, stats });
-        if (!next) { failed.push({ userId: mem.userId, name: mem.name, reason: '模型返回无法解析' }); continue; }
-        const after = next.impressions.map((e) => e.content);
-        const isChanged = after.length !== before.length || after.some((c, i) => c !== before[i]);
-        if (isChanged) changed += 1;
-        results.push({
-          userId: mem.userId,
-          name: mem.name,
-          before: before.length,
-          after: after.length,
-          changed: isChanged,
-          isNew: !!mem.isNew
-        });
-      } catch (error) {
-        failed.push({ userId: mem.userId, name: mem.name, reason: String(error?.message ?? error) });
-      }
-    }
-
-    const discoveredCount = targets.filter((t) => t.isNew).length;
-    const note = this.#buildConsolidateNote({
-      total: targets.length, changed, failed, skipped, only, discoveredCount
-    });
-    this.#markConsolidated(chatKey, targets.map((t) => t.userId).filter(Boolean));
-    return { ok: true, note, changed, results, skipped, failed };
-  }
-
-  /** 统计会话里各成员的出现次数与名字（用于身份识别与"新建印象"）。 */
-  #scanChatActivity(chatKey) {
-    const memberMsgCount = new Map();
-    const nameMsgCount = new Map();
-    const nameToUserId = new Map();
-    const uidToName = new Map();
-    for (const m of this.store.recent(chatKey, { limit: 2000 })) {
-      if (m.self || !m.senderId) continue;
-      const uid = String(m.senderId);
-      memberMsgCount.set(uid, (memberMsgCount.get(uid) || 0) + 1);
-      const nm = String(m.senderName || '').trim();
-      // 跳过占位名（历史脏数据：拍一拍事件曾把 senderName 写成"（拍一拍事件）"）
-      if (nm && !PLACEHOLDER_NAMES.has(nm)) {
-        nameMsgCount.set(nm, (nameMsgCount.get(nm) || 0) + 1);
-        if (!nameToUserId.has(nm)) nameToUserId.set(nm, uid);
-        if (!uidToName.has(uid)) uidToName.set(uid, nm);
-      }
-    }
-    return { memberMsgCount, nameMsgCount, nameToUserId, uidToName };
-  }
-
-  /** 确定一个记忆条目的 QQ 号（必要时反查名字并回写记忆文件）。 */
-  #resolveIdentity(chatKey, mem, stats, notes) {
-    let userId = String(mem.userId || '').trim();
-    let msgCount = userId ? (stats.memberMsgCount.get(userId) || 0) : 0;
-
-    if (msgCount < Orchestrator.MEMBER_MIN_MESSAGES) {
-      const candidates = [notes[userId], mem.name, userId].filter(Boolean);
-      for (const name of candidates) {
-        const byName = stats.nameMsgCount.get(name) || 0;
-        if (byName >= Orchestrator.MEMBER_MIN_MESSAGES) {
-          const matched = stats.nameToUserId.get(name) || '';
-          if (matched) {
-            userId = matched;
-            msgCount = byName;
-            try {
-              this.memory.replaceMember(chatKey, userId, mem.name, mem.impressions.map((e) => e.content));
-            } catch { /* 回写失败不阻塞整理 */ }
-          }
-          break;
-        }
-      }
-    }
-    return { ...mem, userId, name: mem.name || stats.uidToName.get(userId) || '', msgCount };
-  }
-
-  /** 批量整理时是否跳过某人（指定群友 / 强制模式不跳过）。 */
-  #shouldSkip(resolved, force) {
-    if (force) return false;
-    if (resolved.msgCount < Orchestrator.MEMBER_MIN_MESSAGES && !String(resolved.name || '').trim()) return true;
-    if (resolved.msgCount < Orchestrator.MEMBER_MIN_MESSAGES && !resolved.impressions.length) return true;
-    if (resolved.impressions.length < Orchestrator.MEMBER_MIN_IMPRESSIONS) return true;
-    return false;
-  }
-
-  #skipReason(resolved) {
-    if (resolved.impressions.length < Orchestrator.MEMBER_MIN_IMPRESSIONS) return '没有印象';
-    if (resolved.msgCount < Orchestrator.MEMBER_MIN_MESSAGES) return '聊天记录出现不足 3 条';
-    return '无法确认身份';
-  }
-
-  /** 生成人话总结：区分"整理过但没变化"与"真的失败了"。 */
-  #buildConsolidateNote({ total, changed, failed, skipped, only, discoveredCount = 0 }) {
-    const skippedNote = skipped.length
-      ? `（跳过 ${skipped.length} 位：${skipped.slice(0, 3).map((s) => `${s.name || s.userId} ${s.reason}`).join('；')}${skipped.length > 3 ? ' 等' : ''}）`
-      : '';
-    const head = only ? '已整理指定群友' : '已整理';
-    const discoverNote = discoveredCount > 0 ? `（其中 ${discoveredCount} 位是新建印象）` : '';
-    const body = changed > 0
-      ? `${head} ${total} 位${discoverNote}，其中 ${changed} 位印象有更新`
-      : `${head} ${total} 位${discoverNote}，内容无需改动（印象已足够精简）`;
-    const failNote = failed.length
-      ? `；${failed.length} 位失败（已保留原印象）`
-      : '';
-    return body + failNote + skippedNote;
-  }
-
-  /** 记录整理时间，供冷却判断使用。 */
-  #markConsolidated(chatKey, userIds) {
-    const now = Date.now();
-    try {
-      this.memory.markConsolidated(chatKey, now, userIds);
-    } catch (error) {
-      console.warn('[memory] 记录整理时间失败:', error?.message ?? error);
-    }
-  }
-
-  /**
-   * 整理单个群友的印象。
-   *
-   * 两种模式：
-   *   - 整理模式（已有印象）：合并重复、删过时，只减不增，绝不发明新事实
-   *   - 新建模式（isNew，针对零印象的活跃群友）：读他最近的发言，提炼长期印象
-   *
-   * 新建模式是本功能的关键补充：实测有群友聊了 200+ 条却零印象，
-   * 而模型日常几乎不主动调 memory_append —— 没有这个入口就永远补不上。
-   */
-  async #consolidateOneMember(chatKey, mem, { force = false, stats = null } = {}) {
-    const existing = mem.impressions || [];
-    const isNew = !!mem.isNew || (!existing.length && !!force);
-
-    const { system, user } = isNew
-      ? this.#buildNewImpressionPrompt(chatKey, mem, stats)
-      : this.#buildConsolidatePrompt(mem);
-
-    const res = await this.#memoryChat([
-      { role: 'system', content: system },
-      { role: 'user', content: user }
-    ]);
-
-    const parsed = extractJsonObject(String(res?.message?.content ?? ''));
-    if (!parsed) {
-      console.warn(`[memory] ${isNew ? '新建' : '整理'} ${chatKey}/${mem.userId || mem.name} 结果无法解析为 JSON，本轮放弃`);
-      if (process.env.QQ_AGENT_DEBUG_MEMORY) {
-        console.warn('[memory][debug] 原始返回 =', JSON.stringify(String(res?.message?.content ?? '')).slice(0, 1500));
-      }
-      return null;
-    }
-
-    const raw = Array.isArray(parsed.impressions) ? parsed.impressions : [];
-    const maxKeep = Number(getConfig().memory?.maxImpressionsPerMember) || 5;
-
-    // 整理模式：条数变多 = 疑似幻觉，放弃（保留原印象）
-    if (!isNew && raw.length > existing.length) {
-      console.warn(`[memory] 整理 ${chatKey}/${mem.userId} 结果条数变多（${existing.length}→${raw.length}），疑似幻觉，放弃`);
-      return null;
-    }
-
-    const clean = raw
-      .map((s) => String(s ?? '').trim())
-      .filter(Boolean)
-      .slice(0, maxKeep)
-      .map((content) => content.slice(0, 120));
-
-    return this.memory.replaceMember(chatKey, mem.userId, mem.name, clean);
-  }
-
-  /** 整理模式：合并/删减已有印象。 */
-  #buildConsolidatePrompt(mem) {
-    const fmtTs = (t) => new Date(t).toISOString().slice(0, 16).replace('T', ' ');
-    const lines = [`群友 QQ：${mem.userId}`, `当前名字：${mem.name}`];
-    for (const e of mem.impressions) lines.push(`- ${e.content} (${fmtTs(e.createdAt)})`);
-    const maxKeep = Number(getConfig().memory?.maxImpressionsPerMember) || 5;
-    return {
-      system: '你是聊天机器人的记忆整理模块，负责整理对某一位群友的长期印象。你只做合并、改写与删除，绝不发明任何新事实。输出必须是严格的 JSON 对象，不要 Markdown 代码块，不要任何解释文字。格式：{"impressions":["…"]}',
-      user: [
-        '下面是机器人对一位群友的全部印象，请整理：',
-        '1. 把同义/重复的印象合并成一条，以最新的观感为准。',
-        '2. 明显过时、矛盾、或一次性事件（不会再次影响相处）的印象删除。',
-        `3. 最多保留 ${maxKeep} 条，每条不超过 120 字。`,
-        '原则：所有信息只能来自原文，语义不变，宁少勿错；没有可保留的时输出空数组。',
-        '',
-        ...lines
-      ].join('\n')
-    };
-  }
-
-  /** 新建模式：从聊天记录里提炼对某人的长期印象。 */
-  #buildNewImpressionPrompt(chatKey, mem, stats) {
-    const maxKeep = Number(getConfig().memory?.maxImpressionsPerMember) || 5;
-    const uid = String(mem.userId || '');
-    const sample = (this.store.recent(chatKey, { limit: 2000 }) || [])
-      .filter((m) => !m.self && String(m.senderId) === uid)
-      .slice(-40)
-      .map((m) => String(m.text || '').slice(0, 200))
-      .filter(Boolean);
-
-    return {
-      system: '你是聊天机器人的记忆模块，负责从聊天记录里提炼对某一位群友的长期印象。只提炼"以后跟这个人打交道用得上"的稳定特征，严格依据给定的发言，不要编造。输出必须是严格的 JSON 对象，不要 Markdown 代码块，不要任何解释文字。格式：{"impressions":["…"]}',
-      user: [
-        `下面是群友（QQ ${uid}${(mem.name && `，名字 ${mem.name}`) || ''}）最近的部分发言，请提炼对他的长期印象：`,
-        '1. 只保留稳定特征：说话风格、爱玩的梗、常聊话题、雷点、身份关系。',
-        '2. 不要记一次性事件、临时话题，也不要记录流水账。',
-        `3. 最多 ${maxKeep} 条，每条不超过 120 字，用第一人称视角（"他/她…"）。`,
-        '4. 宁少勿错：信息不足就少写，不要脑补。',
-        '5. 若实在提炼不出任何稳定特征，输出空数组。',
-        '',
-        sample.length ? sample.join('\n') : '（没有抓到该群友的发言）'
-      ].join('\n')
-    };
-  }
-
-  /**
-   * 记忆整理专用模型调用。
-   * useChatModel=true 时跟随聊天模型（cfg.api.*）；
-   * false 时使用 cfg.memory.provider/model 指向的目录模型（端点/密钥取自 providers）。
-   */
   async #memoryChat(messages) {
     const cfg = getConfig();
     const mem = cfg.memory || {};
@@ -1095,6 +734,7 @@ export class Orchestrator {
 
   async abortAll() {
     this.aborted = true;
+    this.memoryPipeline.stop();
     for (const timer of this.wakeTimers.values()) clearTimeout(timer);
     this.wakeTimers.clear();
     this.pendingWake.clear();
@@ -1175,67 +815,6 @@ function parseInlineBlock(block) {
       const parsed = JSON.parse(lines.slice(1).join('\n'));
       if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return { name, args: parsed };
     } catch { /* ignore */ }
-  }
-  return null;
-}
-
-/**
- * 聊天记录里可能出现的占位名（非真实昵称）。
- * 来源：历史版本的拍一拍事件把 senderName 硬编码成"（拍一拍事件）"。
- * 取名字时必须跳过，否则记忆里会出现"某人的名字叫（拍一拍事件）"。
- */
-const PLACEHOLDER_NAMES = new Set([
-  '（拍一拍事件）',
-  '(拍一拍事件)',
-  '未知',
-  '某人'
-]);
-
-/**
- * 从模型输出里稳健提取 JSON 对象。
- *
- * 模型并不总会乖乖只吐 JSON，常见变体：
- *   1) ```json\n{...}\n```            —— Markdown 代码块
- *   2) "好的，这是整理结果：\n{...}"   —— 前后带解释文字
- *   3) '{"impressions":[...]}'        —— 用了单引号
- *   4) 结尾多了个逗号                  —— 尾随逗号
- * 原实现只会剥掉"整段被 ``` 包裹"这一种，其余全部解析失败 → 整理静默放弃。
- */
-function extractJsonObject(raw) {
-  const text = String(raw ?? '').trim();
-  if (!text) return null;
-
-  // 1) 先尝试直接解析
-  try { return JSON.parse(text); } catch { /* 继续尝试 */ }
-
-  // 2) 剥掉 ``` 代码块（可能在中间任意位置）
-  const fence = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
-  const candidates = [];
-  if (fence) candidates.push(fence[1].trim());
-
-  // 3) 取第一个 { 到最后一个 } 之间的内容
-  const first = text.indexOf('{');
-  const last = text.lastIndexOf('}');
-  if (first >= 0 && last > first) candidates.push(text.slice(first, last + 1));
-
-  for (const cand of candidates) {
-    try { return JSON.parse(cand); } catch { /* 继续 */ }
-    // 修正常见瑕疵后重试：尾随逗号、单引号
-    try {
-      const fixed = cand
-        .replace(/,\s*([}\]])/g, '$1')          // 尾随逗号
-        .replace(/'/g, '"');                     // 单引号 → 双引号
-      const parsed = JSON.parse(fixed);
-      if (parsed && typeof parsed === 'object') return parsed;
-    } catch { /* 继续 */ }
-    // 兜底：只抽 impressions 数组
-    const arrMatch = cand.match(/"impressions"\s*:\s*\[([\s\S]*?)\]\s*[,}]?/);
-    if (arrMatch) {
-      try {
-        const items = JSON.parse('[' + arrMatch[1].replace(/,\s*$/, '') + ']');
-        return { impressions: items };
-      } catch { /* 继续 */ }
-    }
   }
   return null;
 }

@@ -703,6 +703,47 @@ export function createApp({ log = console.log } = {}) {
       const method = req.method;
       const cfgNow = getConfig();
 
+      if (pathname.startsWith('/api/memory/') || pathname.startsWith('/api/memory-files')) {
+        if (!keyEndpointAllowed(req)) return json(res, 403, { error: '请从本机控制台管理记忆' });
+      }
+      if (pathname.startsWith('/api/memory/')) {
+        try {
+          if (pathname === '/api/memory/persons' && method === 'GET') return json(res, 200, { persons: memory.listPersons() });
+          const personMatch = /^\/api\/memory\/persons\/([^/]+)$/.exec(pathname);
+          if (personMatch && method === 'GET') {
+            const person = memory.getPerson(decodeURIComponent(personMatch[1]));
+            return json(res, person ? 200 : 404, { person });
+          }
+          if (pathname === '/api/memory/records' && method === 'GET') return json(res, 200, { records: memory.listRecords({
+            chatKey: url.searchParams.get('chatKey') || '', personId: url.searchParams.get('personId') || '',
+            kind: url.searchParams.get('kind') || '', includeInactive: url.searchParams.get('includeInactive') === 'true'
+          }) });
+          if (pathname === '/api/memory/records' && method === 'POST') {
+            const body = await readBody(req);
+            if (body.id) throw new Error('新增记忆不能指定 ID');
+            const record = memory.saveRecord(body);
+            emit('memory-update', { phase: 'edit' });
+            return json(res, 200, { record });
+          }
+          const recordMatch = /^\/api\/memory\/records\/(m_[a-zA-Z0-9-]+)$/.exec(pathname);
+          if (recordMatch) {
+            const id = recordMatch[1];
+            if (method === 'GET') {
+              const record = memory.getRecord(id);
+              return json(res, record ? 200 : 404, { record });
+            }
+            if (method === 'PUT' || method === 'DELETE') {
+              const body = await readBody(req);
+              const record = method === 'DELETE' ? memory.deleteRecord(id, body.expectedVersion)
+                : memory.saveRecord({ ...body, id }, { expectedVersion: body.expectedVersion });
+              emit('memory-update', { phase: 'edit' });
+              return json(res, 200, { record });
+            }
+          }
+          return json(res, 404, { error: '未知记忆接口' });
+        } catch (error) { return json(res, /已变化/.test(error.message) ? 409 : 400, { error: String(error.message) }); }
+      }
+
       if (pathname === '/api/mcp/servers' || pathname.startsWith('/api/mcp/servers/')) {
         if (!keyEndpointAllowed(req)) return json(res, 403, { error: '请从本机控制台管理 MCP 服务' });
         try {
@@ -1210,6 +1251,7 @@ export function createApp({ log = console.log } = {}) {
         const next = updateConfig(patch);
         store.setMaxPerChat(next.store?.maxMessagesPerChat ?? 0);
         if (next.proactive?.enabled) orchestrator.startProactiveLoop(); else orchestrator.stopProactiveLoop();
+        if (!orchestrator.aborted) orchestrator.memoryPipeline.resume();
         initPriceFeed(next.api?.priceRemoteUrl || '');   // 远程价格表 URL 可能改了（内部幂等）
         emit('status', { configUpdated: true });
         return json(res, 200, { ok: true, config: { ...next, mcp: { servers: (next.mcp?.servers || []).map(publicMcpServer) } } });
@@ -1321,7 +1363,9 @@ export function createApp({ log = console.log } = {}) {
         const chatKey = `${memoryFileMatch[1]}:${memoryFileMatch[2]}`;
         return json(res, 200, {
           ...memory.query(chatKey),
-          members: memory.members(chatKey)
+          members: memory.members(chatKey),
+          records: memory.listRecords({ chatKey }),
+          job: memory.job(chatKey)
         });
       }
 
@@ -1350,35 +1394,21 @@ export function createApp({ log = console.log } = {}) {
         return json(res, 200, { ok: true });
       }
 
-      // 手动整理某个群的记忆：遍历聊天记录中出现的成员，逐人整理直到收敛
+      // 手动处理会话下一批新消息，与自动任务共用游标。
       if (pathname === '/api/memory-files/consolidate' && method === 'POST') {
         try {
           const body = await readBody(req).catch(() => ({}));
           const chatKey = String(body.chatKey || '');
           if (!/^(group|private):\d+$/.test(chatKey)) return json(res, 400, { ok: false, error: 'chatKey 格式错误' });
 
-          // 可选：只整理指定的群友（QQ 号数组）。不传 = 整理全群。
-          // 传了但记忆里还没有此人时，会从聊天记录里新建印象。
-          let userIds = null;
-          if (body.userIds != null) {
-            const arr = Array.isArray(body.userIds) ? body.userIds : [body.userIds];
-            userIds = arr.map((u) => String(u ?? '').trim()).filter((u) => /^\d{1,15}$/.test(u));
-            if (!userIds.length) return json(res, 400, { ok: false, error: 'userIds 需为 QQ 号数组' });
-          }
-          // 手动触发：跳过门槛/冷却检查，且对零印象的人启用"新建印象"模式
-          const force = body.force !== false;
+          if (body.userIds != null) return json(res, 400, { error: '新记忆按会话增量处理；请省略 userIds，避免跳过其他成员的消息' });
 
           if (orchestrator.consolidating.has(chatKey)) return json(res, 409, { ok: false, error: '该群已在整理中' });
-          orchestrator.consolidating.add(chatKey);
-          emit('memory-update', { chatKey, phase: 'consolidate-start', userIds });
-          orchestrator.consolidateMemoryForChat(chatKey, { userIds, force })
-            .then((result) => {
-              emit('memory-update', { chatKey, phase: 'consolidate-done', ...(result || {}) });
-            })
-            .catch((error) => {
-              emit('memory-update', { chatKey, phase: 'consolidate-error', error: String(error?.message ?? error) });
-            })
-            .finally(() => orchestrator.consolidating.delete(chatKey));
+          if (orchestrator.memoryPipeline.inflight.size >= 2) return json(res, 429, { error: '已有两个记忆任务运行，请稍后重试' });
+          if (orchestrator.paused || orchestrator.aborted || !orchestrator.memoryPipeline.allowed(chatKey)) return json(res, 400, { error: '请先恢复机器人，并将该会话加入白名单' });
+          // All subjects share a chat extraction cursor; a per-person pass could
+          // consume messages needed by others. Always process the complete batch.
+          orchestrator.consolidateMemoryForChat(chatKey).catch(() => {});
           return json(res, 202, { ok: true, started: true });
         } catch (error) {
           return json(res, 400, { ok: false, error: String(error?.message ?? error) });
@@ -1639,6 +1669,7 @@ export function createApp({ log = console.log } = {}) {
     }
     await onebot.connect();
     if (getConfig().proactive?.enabled) orchestrator.startProactiveLoop();
+    orchestrator.memoryPipeline.resume();
     log(`控制台已就绪：http://127.0.0.1:${port}`);
     log(`OneBot（SnowLuma）: ws=${getConfig().snowluma?.wsUrl} http=${getConfig().snowluma?.httpUrl}`);
     log(`模型: ${getConfig().api.model || '（未设置，请在设置里选择）'} @ ${getConfig().api.baseUrl}`);

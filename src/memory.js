@@ -1,548 +1,302 @@
-// 群友印象记忆：每个会话一个文件夹，每个群友一个以 QQ 号命名的 JSON 文件。
-// 目录结构：
-//   data/memory/group_<群号>/<QQ>.json
-//   data/memory/private_<QQ>/<QQ>.json
-// 每个成员文件：{ userId, name, impressions: [{ content, createdAt }], updatedAt, lastConsolidatedAt }
-// 旧版单文件 data/memory/group_<群号>.json 会在首次访问时自动迁移。
+// One QQ identity; scoped, versioned records. A snapshot and its extraction
+// cursor commit together via atomic rename, using the existing Node runtime.
 import fs from 'node:fs';
 import path from 'node:path';
+import crypto from 'node:crypto';
 import { DATA_DIR, getConfig, updateConfig } from './config.js';
 
-const MEMORY_DIR = path.join(DATA_DIR, 'memory');
-
-function chatDirName(chatKey) {
-  return String(chatKey).replace(/[^a-z0-9_]/gi, '_');
+export const MEMORY_KINDS = ['fact', 'preference', 'interaction', 'relationship', 'event', 'commitment'];
+export const MEMORY_STATUSES = ['active', 'pending', 'in_progress', 'completed', 'cancelled', 'superseded', 'expired', 'deleted'];
+const CHAT = /^(group|private):\d+$/;
+const clone = (v) => structuredClone(v);
+const unique = (a) => [...new Set(a)];
+const hash = (v) => crypto.createHash('sha256').update(v).digest('hex').slice(0, 24);
+const subject = (v) => {
+  const s = String(v ?? '').trim();
+  if (s === 'bot' || /^legacy:[a-f0-9]+$/.test(s)) return s;
+  if (/^(qq:)?\d{1,15}$/.test(s)) return s.startsWith('qq:') ? s : `qq:${s}`;
+  throw new Error('人物必须使用数字 QQ 号');
+};
+function contentText(v) {
+  if (typeof v !== 'string' || !v.trim() || v.length > 2000) throw new Error('内容须为 1–2000 字的文本');
+  return v.trim();
 }
-
-function legacyFile(chatKey) {
-  return path.join(MEMORY_DIR, `${chatDirName(chatKey)}.json`);
+function visibility(v) {
+  if (v?.type === 'global') return { type: 'global', chatKeys: [] };
+  if (v?.type !== 'chats' || !Array.isArray(v.chatKeys) || !v.chatKeys.length || v.chatKeys.length > 50 || v.chatKeys.some((k) => !CHAT.test(k))) throw new Error('可见范围必须是全局或指定会话');
+  return { type: 'chats', chatKeys: unique(v.chatKeys).sort() };
 }
-
-function chatDir(chatKey) {
-  return path.join(MEMORY_DIR, chatDirName(chatKey));
-}
-
-function metaFile(chatKey) {
-  return path.join(chatDir(chatKey), '_meta.json');
-}
-
-function memberFileName(userId, name = '') {
-  if (String(userId ?? '').trim()) {
-    const id = String(userId).trim();
-    return /^\d+$/.test(id) ? `${id}.json` : `u_${id.replace(/[^a-z0-9_]/gi, '_')}.json`;
-  }
-  const safe = String(name || 'unknown').trim().replace(/[^a-z0-9_\u4e00-\u9fa5]/gi, '_').slice(0, 40);
-  return `_n_${safe || 'unknown'}.json`;
-}
-
-function memberFile(chatKey, userId, name = '') {
-  return path.join(chatDir(chatKey), memberFileName(userId, name));
-}
-
-function readJson(file, fallback) {
-  try {
-    let text = fs.readFileSync(file, 'utf8');
-    if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1);
-    const parsed = JSON.parse(text);
-    return parsed && typeof parsed === 'object' ? parsed : fallback;
-  } catch {
-    return fallback;
-  }
-}
-
-function writeJson(file, value) {
-  fs.mkdirSync(path.dirname(file), { recursive: true });
-  const tmp = `${file}.${process.pid}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(value, null, 1), 'utf8');
-  fs.renameSync(tmp, file);
-}
-
-function loadMember(chatKey, userId, name = '') {
-  const file = memberFile(chatKey, userId, name);
-  const raw = readJson(file, null);
-  return {
-    userId: String(raw?.userId ?? userId ?? ''),
-    name: String(raw?.name ?? name ?? ''),
-    impressions: Array.isArray(raw?.impressions) ? raw.impressions : [],
-    updatedAt: Number(raw?.updatedAt) || 0,
-    lastConsolidatedAt: Number(raw?.lastConsolidatedAt) || 0
-  };
-}
-
-function loadMeta(chatKey) {
-  const raw = readJson(metaFile(chatKey), null);
-  return { lastConsolidatedAt: Number(raw?.lastConsolidatedAt) || 0 };
-}
+export const memoryVisible = (r, chatKey) => r.visibility.type === 'global' || r.visibility.chatKeys.includes(chatKey);
+const effective = (r) => !['deleted', 'superseded', 'expired'].includes(r.status) && (!r.expiresAt || r.expiresAt > Date.now());
+const sameSubjects = (a, b) => JSON.stringify([...a].sort()) === JSON.stringify([...b].sort());
+const localTo = (r, k) => r.visibility.type === 'chats' && r.visibility.chatKeys.length === 1 && r.visibility.chatKeys[0] === k;
 
 export class MemoryStore {
-  constructor() {
-    this.cache = new Map(); // chatKey -> Map(userId|_n_xx, member)
+  constructor(directory = path.join(DATA_DIR, 'memory')) {
+    this.directory = directory;
+    this.file = path.join(directory, 'v2.json');
+    this.state = null;
   }
-
-  /** 扫描所有有记忆的会话（文件夹或旧版单文件）。 */
-  listChats() {
-    const out = new Set();
-    try {
-      for (const f of fs.readdirSync(MEMORY_DIR)) {
-        if (fs.statSync(path.join(MEMORY_DIR, f)).isDirectory()) {
-          const m = /^(group|private)_(\d+)$/.exec(f);
-          if (m) out.add(`${m[1]}:${m[2]}`);
-        } else {
-          const m = /^(group|private)_(\d+)\.json$/.exec(f);
-          if (m) out.add(`${m[1]}:${m[2]}`);
-        }
-      }
-    } catch { /* 目录不存在 */ }
-    return [...out];
+  #load() {
+    if (this.state) return;
+    if (fs.existsSync(this.file)) {
+      // Corruption must not silently reset memories or extraction progress.
+      const db = JSON.parse(fs.readFileSync(this.file, 'utf8').replace(/^\uFEFF/, ''));
+      if (db.schemaVersion !== 2 || !db.records || !db.persons || !db.jobs) throw new Error('记忆数据库格式错误，请从备份恢复');
+      this.state = db;
+      return;
+    }
+    const db = { schemaVersion: 2, revision: 0, persons: {}, records: {}, jobs: {}, migrations: [] };
+    this.#importLegacy(db);
+    this.#save(db);
   }
-
-  /** 旧版单文件 → 新版每成员文件。迁移后旧文件移到 backups/。 */
-  #migrateLegacy(chatKey) {
-    const legacy = legacyFile(chatKey);
-    if (!fs.existsSync(legacy)) return;
-    try {
-      if (fs.statSync(legacy).isDirectory()) return;
-      const old = readJson(legacy, null);
-      if (!old) return;
-      const notes = getConfig().memberNotes || {};
-      const nameToQq = {};
-      for (const [qq, name] of Object.entries(notes)) {
-        if (name) nameToQq[String(name)] = String(qq);
+  #save(db) {
+    fs.mkdirSync(this.directory, { recursive: true });
+    const tmp = `${this.file}.${crypto.randomUUID()}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(db), 'utf8');
+    fs.renameSync(tmp, this.file);
+    this.state = db;
+  }
+  #transaction(fn) {
+    this.#load();
+    const db = clone(this.state);
+    const result = fn(db);
+    db.revision++;
+    this.#save(db);
+    return clone(result);
+  }
+  #person(db, id, name = '', chatKey = '') {
+    const now = Date.now();
+    const p = db.persons[id] ||= { id, userId: id.startsWith('qq:') ? id.slice(3) : '', name: '', aliases: [], createdAt: now, updatedAt: now };
+    if (name && !p.aliases.some((a) => a.name === name && a.chatKey === chatKey)) {
+      p.aliases.push({ name: String(name).slice(0, 60), chatKey, observedAt: now });
+      p.name ||= String(name).slice(0, 60);
+      p.updatedAt = now;
+    }
+    return p;
+  }
+  #importLegacy(db) {
+    if (!fs.existsSync(this.directory)) return;
+    const files = [];
+    for (const e of fs.readdirSync(this.directory, { withFileTypes: true })) {
+      const m = /^(group|private)_(\d+)(\.json)?$/.exec(e.name);
+      if (!m) continue;
+      const chatKey = `${m[1]}:${m[2]}`;
+      if (e.isFile() && m[3]) files.push({ relative: e.name, chatKey, flat: true });
+      if (e.isDirectory() && !m[3]) for (const f of fs.readdirSync(path.join(this.directory, e.name))) {
+        if (f.endsWith('.json')) files.push({ relative: path.join(e.name, f), chatKey, flat: false });
       }
-      const migrated = [];
-      for (const e of Array.isArray(old.memberImpression) ? old.memberImpression : []) {
+    }
+    // Read/validate all sources first. Preserve originals and a separate backup.
+    const sources = files.map((f) => ({ ...f, raw: JSON.parse(fs.readFileSync(path.join(this.directory, f.relative), 'utf8').replace(/^\uFEFF/, '')) }));
+    const backup = path.join(this.directory, 'backups', `before-v2-${Date.now()}-${crypto.randomUUID()}`);
+    for (const f of sources) {
+      const dest = path.join(backup, f.relative);
+      fs.mkdirSync(path.dirname(dest), { recursive: true });
+      fs.copyFileSync(path.join(this.directory, f.relative), dest);
+      const entries = f.flat ? (f.raw.memberImpression || []) : (f.raw.impressions || []);
+      if (!Array.isArray(entries)) throw new Error(`旧记忆格式错误：${f.relative}`);
+      for (const [index, e] of entries.entries()) {
         if (!e?.content) continue;
-        const target = String(e.target || '').trim();
-        let userId = /^\d{5,15}$/.test(target) ? target : (nameToQq[target] || '');
-        migrated.push({
-          userId,
-          name: target,
-          content: String(e.content).slice(0, 300),
-          createdAt: Number(e.createdAt) || Date.now()
-        });
+        const uid = String(f.flat ? (e.userId || (/^\d+$/.test(e.target) ? e.target : '')) : (f.raw.userId || ''));
+        const name = String(f.flat ? e.target || uid : f.raw.name || uid);
+        const sid = /^\d{1,15}$/.test(uid) ? subject(uid) : `legacy:${hash(`${f.chatKey}/${f.relative}/${name}`)}`;
+        this.#person(db, sid, name, f.chatKey);
+        const id = `m_${hash(`${f.relative}/${index}`)}`;
+        db.records[id] = {
+          id, kind: 'fact', content: String(e.content), subjectIds: [sid], title: '', eventId: null,
+          visibility: { type: 'chats', chatKeys: [f.chatKey] }, evidence: 'legacy', sources: [],
+          legacySource: { file: f.relative, index, name, chatKey: f.chatKey }, status: 'active', pinned: false,
+          createdAt: Number(e.createdAt) || Date.now(), updatedAt: Number(f.raw.updatedAt) || Number(e.createdAt) || Date.now(),
+          expiresAt: null, version: 1, history: []
+        };
       }
-      // 旧的 activeTopic/pendingThought 直接丢弃（本版只保留群友印象）
-      for (const m of migrated) this.#appendRaw(chatKey, m.userId, m.name, m.content, m.createdAt);
-      const backupDir = path.join(MEMORY_DIR, 'backups');
-      fs.mkdirSync(backupDir, { recursive: true });
-      const backup = path.join(backupDir, path.basename(legacy));
-      if (fs.existsSync(backup)) fs.rmSync(backup, { force: true });
-      fs.renameSync(legacy, backup);
-    } catch (error) {
-      console.error('[memory] 旧记忆迁移失败:', error?.message ?? error);
+      db.migrations.push({ file: f.relative, backup: path.relative(this.directory, dest), at: Date.now() });
     }
   }
-
-  #ensureChat(chatKey) {
-    this.#migrateLegacy(chatKey);
-    if (!this.cache.has(chatKey)) {
-      const map = new Map();
-      try {
-        for (const f of fs.readdirSync(chatDir(chatKey))) {
-          if (!f.endsWith('.json') || f === '_meta.json') continue;
-          const raw = readJson(path.join(chatDir(chatKey), f), null);
-          if (!raw) continue;
-          const key = raw.userId ? String(raw.userId) : `_n_${f}`;
-          map.set(key, loadMember(chatKey, raw.userId, raw.name));
-        }
-      } catch { /* 尚无文件夹 */ }
-      this.#mergeNameDuplicates(chatKey, map);
-      this.cache.set(chatKey, map);
-    }
-    return this.cache.get(chatKey);
+  listRecords({ chatKey = '', personId = '', kind = '', includeInactive = false } = {}) {
+    this.#load();
+    const sid = personId ? subject(personId) : '';
+    return clone(Object.values(this.state.records).filter((r) =>
+      (!chatKey || memoryVisible(r, chatKey)) && (!sid || r.subjectIds.includes(sid)) && (!kind || r.kind === kind) &&
+      (includeInactive || effective(r))).sort((a, b) => b.updatedAt - a.updatedAt));
   }
-
-  /**
-   * 合并"同一个人被存成两份"的历史数据。
-   *
-   * 背景：早期没有 QQ 号时会按名字落文件（_n_xxx.json）。后来拿到 QQ 号再次写入时，
-   * 会新建 <QQ>.json，但旧的 _n_ 文件不会被清理 → 同一个人在记忆里出现两次，
-   * 印象重复、整理时互相干扰，也让"印象总数"虚高。
-   *
-   * 规则：无 QQ 号的条目，只要有同名（且该名字对应的条目有 QQ 号），
-   * 就把它的印象并入该 QQ 号条目，然后删除 _n_ 文件。
-   */
-  #mergeNameDuplicates(chatKey, map) {
-    const nameToId = new Map();
-    for (const m of map.values()) {
-      const uid = String(m.userId || '').trim();
-      const nm = String(m.name || '').trim();
-      if (uid && nm) nameToId.set(nm, uid);
-    }
-    const toDelete = [];
-    for (const [key, m] of map.entries()) {
-      const uid = String(m.userId || '').trim();
-      if (uid) continue;                       // 已有 QQ 号，不是兜底条目
-      const nm = String(m.name || '').trim();
-      const targetId = nameToId.get(nm);
-      if (!targetId) continue;
-      const target = map.get(targetId);
-      if (!target) continue;
-
-      const seen = new Set(target.impressions.map((e) => e.content));
-      let added = 0;
-      for (const e of m.impressions) {
-        if (seen.has(e.content)) continue;
-        seen.add(e.content);
-        target.impressions.push({ ...e });
-        added += 1;
+  getRecord(id) { this.#load(); return clone(this.state.records[id] || null); }
+  listPersons() {
+    this.#load();
+    return clone(Object.values(this.state.persons).map((p) => ({ ...p,
+      recordCount: Object.values(this.state.records).filter((r) => effective(r) && r.subjectIds.includes(p.id)).length
+    })).sort((a, b) => b.updatedAt - a.updatedAt));
+  }
+  getPerson(id) {
+    const sid = subject(id), p = this.listPersons().find((x) => x.id === sid);
+    if (!p) return null;
+    // Admin-only profile view. Prompt selection remains in formatForPrompt.
+    return { ...p, profile: this.listRecords({ personId: sid }).filter((r) => ['fact', 'preference', 'interaction'].includes(r.kind) && ['explicit', 'admin'].includes(r.evidence)) };
+  }
+  listChats() {
+    this.#load();
+    return unique([...Object.keys(this.state.jobs), ...Object.values(this.state.persons).flatMap((p) => p.aliases.map((a) => a.chatKey)),
+      ...Object.values(this.state.records).flatMap((r) => [...r.visibility.chatKeys, ...r.sources.map((s) => s.chatKey), r.legacySource?.chatKey])].filter((k) => CHAT.test(k)));
+  }
+  #put(db, input, { actor = 'admin', expectedVersion } = {}) {
+    const old = input.id ? db.records[input.id] : null;
+    if (input.id && !old) throw new Error('记忆不存在');
+    if (old && expectedVersion !== old.version) throw new Error('记忆已变化，请刷新后重试');
+    if (old?.pinned && actor !== 'admin') throw new Error('固定记忆只能由管理员修改');
+    if (old?.status === 'deleted') throw new Error('已删除记忆不能更新');
+    const r = { ...old, ...input };
+    if (!MEMORY_KINDS.includes(r.kind)) throw new Error('未知记忆类型');
+    r.content = contentText(r.content);
+    if (!Array.isArray(r.subjectIds) || !r.subjectIds.length || r.subjectIds.length > 30) throw new Error('须指定 1–30 个主体');
+    r.subjectIds = unique(r.subjectIds.map(subject));
+    if (r.subjectIds.some((id) => id.startsWith('legacy:') && !db.persons[id])) throw new Error('未知历史人物');
+    r.visibility = visibility(r.visibility);
+    r.status ||= 'active';
+    if (!MEMORY_STATUSES.includes(r.status)) throw new Error('未知记忆状态');
+    r.evidence ||= actor === 'admin' ? 'admin' : 'inferred';
+    if (!['explicit', 'reported', 'inferred', 'admin', 'legacy'].includes(r.evidence)) throw new Error('未知证据类型');
+    r.title = String(r.title || '').slice(0, 120);
+    r.eventId ||= null;
+    if (r.eventId && r.eventId !== old?.eventId && (!db.records[r.eventId] || r.eventId === r.id || !['event', 'commitment'].includes(db.records[r.eventId].kind) || !effective(db.records[r.eventId]))) throw new Error('关联事件不存在或已失效');
+    r.expiresAt = r.expiresAt == null || r.expiresAt === '' ? null : Number(r.expiresAt);
+    if (r.expiresAt !== null && (!Number.isFinite(r.expiresAt) || r.expiresAt <= 0)) throw new Error('过期时间格式错误');
+    r.pinned = actor === 'admin' ? !!r.pinned : !!old?.pinned;
+    r.sources = old?.sources || [];
+    if (input._sources) r.sources = [...r.sources, ...input._sources.filter((s) => !r.sources.some((o) => o.chatKey === s.chatKey && o.messageId === s.messageId))];
+    delete r._sources;
+    r.id = old?.id || `m_${crypto.randomUUID()}`;
+    r.createdAt = old?.createdAt || Date.now(); r.updatedAt = Date.now(); r.version = (old?.version || 0) + 1;
+    r.history = old ? [...old.history, { ...old, history: undefined, changedBy: actor, changedAt: r.updatedAt }] : [];
+    for (const sid of r.subjectIds) this.#person(db, sid);
+    db.records[r.id] = r;
+    return r;
+  }
+  saveRecord(input, { expectedVersion, actor = 'admin' } = {}) {
+    const fields = ['id', 'kind', 'content', 'subjectIds', 'visibility', 'status', 'title', 'eventId', 'expiresAt', 'pinned'];
+    const value = Object.fromEntries(fields.filter((k) => input[k] !== undefined).map((k) => [k, input[k]]));
+    if (actor === 'admin') value.evidence = 'admin';
+    return this.#transaction((db) => this.#put(db, value, { expectedVersion, actor }));
+  }
+  deleteRecord(id, expectedVersion) { return this.saveRecord({ id, status: 'deleted' }, { expectedVersion }); }
+  job(chatKey) { this.#load(); return clone(this.state.jobs[chatKey] || { cursor: 0, lastSuccessAt: 0, lastError: '', failures: 0 }); }
+  recordFailure(chatKey, error) {
+    return this.#transaction((db) => db.jobs[chatKey] = { ...this.job(chatKey), lastError: String(error).slice(0, 500), failures: (db.jobs[chatKey]?.failures || 0) + 1 });
+  }
+  recordUsage(chatKey, usage) {
+    return this.#transaction((db) => {
+      const job = this.job(chatKey), previous = job.usage || { calls: 0, promptTokens: 0, completionTokens: 0, totalTokens: 0 };
+      const number = (v) => Math.max(0, Number(v) || 0);
+      const prompt = number(usage?.prompt_tokens), completion = number(usage?.completion_tokens);
+      job.usage = { calls: previous.calls + 1, promptTokens: previous.promptTokens + prompt,
+        completionTokens: previous.completionTokens + completion, totalTokens: previous.totalTokens + number(usage?.total_tokens || prompt + completion) };
+      db.jobs[chatKey] = job; return job.usage;
+    });
+  }
+  commitExtraction(chatKey, messages, candidates, { cursor, advance = true, knownIds = [] } = {}) {
+    if (!CHAT.test(chatKey) || !Array.isArray(candidates) || candidates.length > 40) throw new Error('抽取结果格式错误');
+    return this.#transaction((db) => {
+      const prior = this.job(chatKey);
+      if (advance && prior.cursor !== cursor) throw new Error('抽取游标已变化，请重试');
+      const messageMap = new Map(messages.map((m) => [Number(m.id), m]));
+      const allowed = new Set([...knownIds.map(subject), ...messages.filter((m) => /^\d{1,15}$/.test(m.senderId)).map((m) => subject(m.senderId)), 'bot']);
+      for (const m of messages) if (!m.self && /^\d{1,15}$/.test(m.senderId)) this.#person(db, subject(m.senderId), m.senderName, chatKey);
+      const changed = [];
+      for (const c of candidates) {
+        if (c.status === 'deleted') throw new Error('抽取不能删除记忆，请使用被替代或过期状态');
+        if (!Array.isArray(c.sourceMessageIds) || !c.sourceMessageIds.length || c.sourceMessageIds.some((id) => !messageMap.has(Number(id)))) throw new Error('记忆引用了批次外的消息');
+        const refs = unique(c.sourceMessageIds.map(Number)).map((id) => messageMap.get(id));
+        const ids = (c.subjectIds || []).map(subject);
+        if (ids.some((id) => !allowed.has(id))) throw new Error('记忆包含无法确认的 QQ 身份');
+        if (!['explicit', 'reported', 'inferred'].includes(c.evidence)) throw new Error('抽取结果须注明证据类型');
+        let evidence = c.evidence;
+        const speakers = new Set(refs.map((m) => m.self ? 'bot' : subject(m.senderId)));
+        if (evidence === 'explicit' && ids.some((id) => !speakers.has(id))) evidence = 'reported';
+        const old = c.targetId ? db.records[c.targetId] : null;
+        if (c.targetId && (!old || !localTo(old, chatKey) || !effective(old) || old.pinned || !sameSubjects(ids, old.subjectIds))) throw new Error('抽取不能修改其他范围、其他人物或固定记忆');
+        const content = contentText(c.content);
+        const sources = refs.map((m) => ({ chatKey, messageId: m.id, mid: m.mid ?? null, senderId: m.self ? 'bot' : String(m.senderId), ts: m.ts, text: String(m.text || '').slice(0, 4000) }));
+        // Include tombstones in duplicate checks to avoid resurrecting deletions.
+        if (!old && Object.values(db.records).some((r) => r.content === content && r.kind === c.kind && sameSubjects(r.subjectIds, ids) && localTo(r, chatKey))) continue;
+        changed.push(this.#put(db, { id: c.targetId, kind: c.kind, content, subjectIds: ids, title: c.title || old?.title || '', eventId: c.eventId || old?.eventId || null,
+          visibility: old?.visibility || { type: 'chats', chatKeys: [chatKey] }, evidence, _sources: sources,
+          status: c.status || old?.status || 'active', expiresAt: c.expiresAt ?? old?.expiresAt ?? null }, { actor: 'extractor', expectedVersion: c.targetVersion }));
       }
-      if (added) {
-        target.impressions.sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0));
-        target.updatedAt = Math.max(Number(target.updatedAt) || 0, Number(m.updatedAt) || 0);
-        writeJson(memberFile(chatKey, targetId, target.name), target);
-      }
-      // 删除已被并入的兜底文件
-      try { fs.rmSync(memberFile(chatKey, '', nm), { force: true }); } catch { /* ignore */ }
-      toDelete.push(key);
-      console.log(`[memory] 合并重复记忆：${nm}（无 QQ 号）→ ${targetId}，并入 ${added} 条`);
-    }
-    for (const k of toDelete) map.delete(k);
+      if (advance) db.jobs[chatKey] = { ...prior, cursor: Math.max(cursor, ...messages.map((m) => m.id)), lastSuccessAt: Date.now(), lastError: '', failures: 0 };
+      return { changed: changed.length, records: changed, cursor: db.jobs[chatKey]?.cursor || 0 };
+    });
   }
-
-  #appendRaw(chatKey, userId, name, content, createdAt = Date.now()) {
-    const map = this.#ensureChat(chatKey);
-    const key = userId ? String(userId) : `_n_${memberFileName('', name)}`;
-    const member = map.get(key) || loadMember(chatKey, userId, name);
-    const entry = {
-      content: String(content ?? '').slice(0, 300),
-      createdAt: Number(createdAt) || Date.now()
-    };
-    if (!member.impressions.some((e) => e.content === entry.content)) {
-      member.impressions.push(entry);
-    }
-    member.userId = String(userId ?? member.userId ?? '');
-    member.name = String(name || member.name || '');
-    member.updatedAt = Date.now();
-    writeJson(memberFile(chatKey, userId, name), member);
-    map.set(key, member);
-    return entry;
+  // Compatibility projection: current participant + last three facts, no new recall.
+  members(chatKey) {
+    const records = this.listRecords({ chatKey }).filter((r) => !['event', 'commitment'].includes(r.kind) && r.status === 'active');
+    const persons = this.listPersons();
+    return unique(records.flatMap((r) => r.subjectIds)).map((id) => {
+      const p = persons.find((x) => x.id === id);
+      const rs = records.filter((r) => r.subjectIds.includes(id)).sort((a, b) => a.updatedAt - b.updatedAt);
+      return { userId: p?.userId || '', personId: id, name: p?.aliases.findLast((a) => a.chatKey === chatKey)?.name || p?.name || id,
+        impressions: rs.map((r) => ({ id: r.id, content: r.content, evidence: r.evidence, createdAt: r.createdAt })), updatedAt: Math.max(...rs.map((r) => r.updatedAt)), lastConsolidatedAt: this.job(chatKey).lastSuccessAt };
+    }).sort((a, b) => b.updatedAt - a.updatedAt);
   }
-
-  /** 记一条对群友的印象。extra: { userId, target } */
-  append(chatKey, category, content, extra = {}) {
-    if (category !== 'memberImpression') return null;
-    const userId = String(extra.userId ?? '').trim();
-    const target = String(extra.target ?? '').trim().slice(0, 60);
-    if (!userId && !target) return null;
-    return this.#appendRaw(chatKey, userId, target || userId, content);
-  }
-
-  /** 所有成员的印象（扁平列表，兼容旧消费方）。 */
   query(chatKey, category = '') {
     if (category && category !== 'memberImpression') return { [category]: [] };
-    const map = this.#ensureChat(chatKey);
-    const memberImpression = [];
-    for (const m of map.values()) {
-      for (const e of m.impressions) {
-        memberImpression.push({
-          userId: String(m.userId || ''),
-          target: String(m.name || m.userId || '某人'),
-          content: e.content,
-          createdAt: e.createdAt
-        });
+    return { memberImpression: this.members(chatKey).flatMap((m) => m.impressions.map((e) => ({ ...e, userId: m.userId, target: m.name }))).sort((a, b) => b.createdAt - a.createdAt) };
+  }
+  getMember(chatKey, userId) { return this.members(chatKey).find((m) => m.userId === String(userId)) || { userId: String(userId), name: '', impressions: [], updatedAt: 0 }; }
+  append(chatKey, category, content, extra = {}) {
+    if (category !== 'memberImpression') return null;
+    if (!CHAT.test(chatKey)) throw new Error('会话格式错误');
+    const sid = subject(extra.userId);
+    return this.#transaction((db) => {
+      this.#person(db, sid, extra.target, chatKey);
+      return Object.values(db.records).find((r) => effective(r) && r.content === content && sameSubjects(r.subjectIds, [sid]) && localTo(r, chatKey)) ||
+        this.#put(db, { kind: 'fact', content, subjectIds: [sid], visibility: { type: 'chats', chatKeys: [chatKey] }, evidence: 'inferred' }, { actor: 'tool' });
+    });
+  }
+  remove(chatKey, category, { userId = '', content = '' } = {}) {
+    if (category !== 'memberImpression' || !userId || !content) return false;
+    return this.#transaction((db) => {
+      let removed = false;
+      for (const r of Object.values(db.records)) if (effective(r) && r.kind === 'fact' && !r.pinned && sameSubjects(r.subjectIds, [subject(userId)]) && r.content === content && localTo(r, chatKey)) {
+        this.#put(db, { ...r, status: 'superseded' }, { actor: 'tool', expectedVersion: r.version }); removed = true;
       }
-    }
-    memberImpression.sort((a, b) => b.createdAt - a.createdAt);
-    return { memberImpression };
+      return removed;
+    });
   }
-
-  /** 成员级视图（记忆页签用）。 */
-  members(chatKey) {
-    const map = this.#ensureChat(chatKey);
-    const list = [];
-    for (const m of map.values()) {
-      if (!m.impressions.length) continue;
-      list.push({
-        userId: String(m.userId || ''),
-        name: String(m.name || m.userId || '某人'),
-        impressions: m.impressions.map((e) => ({ ...e })),
-        updatedAt: m.updatedAt,
-        lastConsolidatedAt: m.lastConsolidatedAt
-      });
-    }
-    list.sort((a, b) => b.updatedAt - a.updatedAt);
-    return list;
-  }
-
-  /** 单个成员的印象（含空成员）。 */
-  getMember(chatKey, userId) {
-    const map = this.#ensureChat(chatKey);
-    const m = map.get(String(userId)) || loadMember(chatKey, String(userId));
-    return {
-      userId: String(m.userId || userId || ''),
-      name: String(m.name || ''),
-      impressions: (m.impressions || []).map((e) => ({ ...e })),
-      updatedAt: Number(m.updatedAt) || 0
-    };
-  }
-
-  /** 编辑群友印象（管理端）：QQ 号由调用方提供，自动回填名字，保存备注到配置。 */
-  editMemberImpression(chatKey, { userId, name = '', note = '', impressions = [] }) {
-    const uid = String(userId ?? '').trim();
-    if (!/^\d{1,15}$/.test(uid)) throw new Error('userId 必须是数字 QQ 号');
-    const map = this.#ensureChat(chatKey);
-    const old = map.get(uid) || loadMember(chatKey, uid, name);
-    const finalName = String(name ?? '').trim().slice(0, 60) || String(old.name || '').trim() || uid;
-    const list = Array.isArray(impressions) ? impressions : [impressions];
-    const now = Date.now();
-    const entries = list
-      .map((s) => String(s ?? '').trim())
-      .filter(Boolean)
-      .slice(0, 20)
-      .map((content) => ({ content: content.slice(0, 300), createdAt: now }));
-    const member = {
-      userId: uid,
-      name: finalName,
-      impressions: entries,
-      updatedAt: now,
-      lastConsolidatedAt: old.lastConsolidatedAt || 0
-    };
-    writeJson(memberFile(chatKey, uid, finalName), member);
-    map.set(uid, member);
-    // 备注写入配置 memberNotes
-    if (note !== undefined && note !== null) {
+  editMemberImpression(chatKey, { userId, name = '', note, impressions = [] }) {
+    this.replaceMember(chatKey, userId, name, impressions);
+    if (note != null) {
       const notes = { ...(getConfig().memberNotes || {}) };
-      const n = String(note ?? '').trim();
-      if (n) notes[uid] = n;
-      else delete notes[uid];
-      updateConfig({ memberNotes: notes });
+      if (String(note).trim()) notes[String(userId)] = String(note).trim(); else delete notes[String(userId)];
+      updateConfig({ memberNotes: { __replace__: notes } });
     }
-    return {
-      userId: member.userId,
-      name: member.name,
-      impressions: member.impressions.map((e) => ({ ...e })),
-      updatedAt: member.updatedAt,
-      note: String(note ?? '').trim()
-    };
+    return this.getMember(chatKey, userId);
   }
-
-  /** 手动替换某成员的全部印象（管理端编辑用）。返回更新后的成员。 */
+  // Old management bulk edits affect only local single-person facts.
   replaceMember(chatKey, userId, name, contents) {
-    const uid = String(userId ?? '').trim();
-    if (!/^\d{1,15}$/.test(uid)) throw new Error('userId 必须是数字 QQ 号');
-    const map = this.#ensureChat(chatKey);
-    const old = map.get(uid) || loadMember(chatKey, uid, name);
-    const finalName = String(name ?? '').trim().slice(0, 60) || String(old.name || '').trim() || uid;
-    const list = Array.isArray(contents) ? contents : [contents];
-    const now = Date.now();
-    const impressions = list
-      .map((s) => String(s ?? '').trim())
-      .filter(Boolean)
-      .slice(0, 20)
-      .map((content) => ({ content: content.slice(0, 300), createdAt: now }));
-    const member = {
-      userId: uid,
-      name: finalName,
-      impressions,
-      updatedAt: now,
-      lastConsolidatedAt: old.lastConsolidatedAt || 0
-    };
-    // 单个成员替换也备份原文件（保留最近一次）
-    try {
-      const backupDir = path.join(MEMORY_DIR, 'backups', chatDirName(chatKey));
-      fs.mkdirSync(backupDir, { recursive: true });
-      const src = memberFile(chatKey, uid, finalName);
-      if (fs.existsSync(src)) {
-        const dst = path.join(backupDir, path.basename(src));
-        if (fs.existsSync(dst)) fs.rmSync(dst, { force: true });
-        fs.copyFileSync(src, dst);
-      }
-    } catch { /* 备份失败不阻塞 */ }
-    writeJson(memberFile(chatKey, uid, finalName), member);
-    map.set(uid, member);
-    return {
-      userId: member.userId,
-      name: member.name,
-      impressions: member.impressions.map((e) => ({ ...e })),
-      updatedAt: member.updatedAt
-    };
+    if (!CHAT.test(chatKey) || !Array.isArray(contents) || contents.length > 100) throw new Error('编辑格式错误');
+    const sid = subject(userId);
+    this.#transaction((db) => {
+      this.#person(db, sid, name, chatKey);
+      const old = Object.values(db.records).filter((r) => effective(r) && r.kind === 'fact' && sameSubjects(r.subjectIds, [sid]) && localTo(r, chatKey));
+      const wanted = unique(contents.map(contentText));
+      for (const r of old) if (!wanted.includes(r.content)) this.#put(db, { ...r, status: 'deleted' }, { expectedVersion: r.version });
+      for (const content of wanted) if (!old.some((r) => r.content === content)) this.#put(db, { kind: 'fact', content, subjectIds: [sid], visibility: { type: 'chats', chatKeys: [chatKey] }, evidence: 'admin' });
+    });
+    return this.getMember(chatKey, userId);
   }
-
-  /** 删除某成员的印象文件。 */
-  removeMember(chatKey, userId) {
-    const uid = String(userId ?? '').trim();
-    if (!/^\d{1,15}$/.test(uid)) return false;
-    const map = this.#ensureChat(chatKey);
-    const m = map.get(uid) || loadMember(chatKey, uid);
-    map.delete(uid);
-    try { fs.rmSync(memberFile(chatKey, uid, m.name), { force: true }); } catch { /* ignore */ }
-    return true;
-  }
-
-  remove(chatKey, category, { userId = '', target = '', content = '' } = {}) {
-    if (category !== 'memberImpression') return false;
-    const map = this.#ensureChat(chatKey);
-    let removed = false;
-    for (const [key, m] of [...map.entries()]) {
-      if (userId) {
-        if (String(m.userId) === String(userId)) {
-          if (content) {
-            const before = m.impressions.length;
-            m.impressions = m.impressions.filter((e) => e.content !== content);
-            removed = removed || m.impressions.length !== before;
-          } else {
-            removed = true;
-            m.impressions = [];
-          }
-          if (!m.impressions.length) {
-            map.delete(key);
-            try { fs.rmSync(memberFile(chatKey, m.userId, m.name), { force: true }); } catch { /* ignore */ }
-          } else {
-            m.updatedAt = Date.now();
-            writeJson(memberFile(chatKey, m.userId, m.name), m);
-          }
-        }
-      } else if (target) {
-        const matchName = String(target).trim();
-        if (String(m.name || m.userId) === matchName) {
-          if (content) {
-            const before = m.impressions.length;
-            m.impressions = m.impressions.filter((e) => e.content !== content);
-            removed = removed || m.impressions.length !== before;
-          } else {
-            removed = true;
-            m.impressions = [];
-          }
-          if (!m.impressions.length) {
-            map.delete(key);
-            try { fs.rmSync(memberFile(chatKey, m.userId, m.name), { force: true }); } catch { /* ignore */ }
-          } else {
-            m.updatedAt = Date.now();
-            writeJson(memberFile(chatKey, m.userId, m.name), m);
-          }
-        }
-      }
-    }
-    return removed;
-  }
-
+  removeMember(chatKey, userId) { this.replaceMember(chatKey, userId, '', []); return true; }
   clear(chatKey) {
-    const map = this.#ensureChat(chatKey);
-    for (const m of map.values()) {
-      try { fs.rmSync(memberFile(chatKey, m.userId, m.name), { force: true }); } catch { /* ignore */ }
-    }
-    map.clear();
-    writeJson(metaFile(chatKey), { lastConsolidatedAt: Date.now() });
+    this.#transaction((db) => { for (const r of Object.values(db.records)) if (effective(r) && localTo(r, chatKey)) this.#put(db, { ...r, status: 'deleted' }, { expectedVersion: r.version }); });
   }
-
-  /**
-   * 生成提示词里的【对群友的印象】摘要。
-   * opts.userIds 提供时只包含这些成员（相关成员注入，控制 token）。
-   */
+  consolidationState(chatKey) {
+    const ms = this.members(chatKey);
+    return { lastConsolidatedAt: this.job(chatKey).lastSuccessAt, counts: { memberImpression: ms.reduce((n, m) => n + m.impressions.length, 0) }, members: ms.map((m) => ({ ...m, count: m.impressions.length })) };
+  }
   formatForPrompt(chatKey, { userIds = null } = {}) {
     const notes = getConfig().memberNotes || {};
-    const all = this.members(chatKey);
-    if (!all.length) return '';
     const filter = userIds ? new Set([...userIds].map(String)) : null;
-    const picked = filter
-      ? all.filter((m) => !m.userId || filter.has(String(m.userId)))  // 无 QQ 号的旧数据始终带上
-      : all.slice(0, 15);
-    if (!picked.length) return '';
-    const lines = ['【对群友的印象】'];
-    for (const m of picked) {
-      const who = notes[String(m.userId)] || m.name || String(m.userId || '') || '某人';
-      for (const e of m.impressions.slice(-3)) lines.push(`- ${who}：${e.content}`);
-    }
-    return lines.join('\n');
-  }
-
-  // ── 自动整理（consolidation）──
-
-  consolidationState(chatKey) {
-    const map = this.#ensureChat(chatKey);
-    let total = 0;
-    let lastConsolidatedAt = 0;
-    const members = [];
-    for (const m of map.values()) {
-      total += m.impressions.length;
-      lastConsolidatedAt = Math.max(lastConsolidatedAt, m.lastConsolidatedAt || 0);
-      members.push({
-        userId: String(m.userId || ''),
-        name: String(m.name || m.userId || ''),
-        count: m.impressions.length,
-        lastConsolidatedAt: m.lastConsolidatedAt || 0
-      });
-    }
-    return {
-      lastConsolidatedAt: loadMeta(chatKey).lastConsolidatedAt || lastConsolidatedAt,
-      counts: { memberImpression: total },
-      members
-    };
-  }
-
-  /**
-   * 记录一次整理完成的时间。
-   * 同时写会话级 _meta.json（供冷却判断）与各成员文件的 lastConsolidatedAt。
-   * userIds 为空时只更新会话级时间。
-   */
-  markConsolidated(chatKey, at = Date.now(), userIds = []) {
-    try {
-      fs.mkdirSync(chatDir(chatKey), { recursive: true });
-      const prev = readJson(metaFile(chatKey), {}) || {};
-      writeJson(metaFile(chatKey), { ...prev, lastConsolidatedAt: Number(at) || Date.now() });
-    } catch (error) {
-      console.warn('[memory] 写整理时间失败:', error?.message ?? error);
-    }
-    const map = this.#ensureChat(chatKey);
-    for (const uid of userIds || []) {
-      const key = String(uid ?? '').trim();
-      if (!key) continue;
-      const m = map.get(key);
-      if (!m) continue;
-      m.lastConsolidatedAt = Number(at) || Date.now();
-      try { writeJson(memberFile(chatKey, m.userId, m.name), m); } catch { /* ignore */ }
-    }
-  }
-
-  /**
-   * 用整理结果整体替换本会话的印象（按成员写回各自文件）。
-   * next.memberImpression: [{ userId?, target?, content }]
-   */
-  replaceConsolidated(chatKey, next) {
-    const cut = (s, n) => String(s ?? '').trim().slice(0, n);
-    const now = Date.now();
-    const groups = new Map(); // key -> { userId, name, contents }
-    for (const item of Array.isArray(next?.memberImpression) ? next.memberImpression.slice(0, 15) : []) {
-      const content = cut(item?.content, 300);
-      if (!content) continue;
-      const userId = cut(item?.userId, 40) || '';
-      const name = cut(item?.target, 60) || userId;
-      const key = userId || `_n_${memberFileName('', name)}`;
-      if (!groups.has(key)) groups.set(key, { userId, name, contents: [] });
-      groups.get(key).contents.push(content);
-    }
-    const map = this.#ensureChat(chatKey);
-    // 整理前把整个会话文件夹备份到 data/memory/backups/<会话>/（保留最近一次）
-    try {
-      const backupDir = path.join(MEMORY_DIR, 'backups', chatDirName(chatKey));
-      fs.rmSync(backupDir, { recursive: true, force: true });
-      fs.mkdirSync(backupDir, { recursive: true });
-      for (const m of map.values()) {
-        const src = memberFile(chatKey, m.userId, m.name);
-        if (fs.existsSync(src)) fs.copyFileSync(src, path.join(backupDir, path.basename(src)));
-      }
-      const metaSrc = metaFile(chatKey);
-      if (fs.existsSync(metaSrc)) fs.copyFileSync(metaSrc, path.join(backupDir, '_meta.json'));
-    } catch { /* 备份失败不阻塞整理 */ }
-    // 删除所有现有成员文件（整理结果会重建）
-    for (const m of map.values()) {
-      try { fs.rmSync(memberFile(chatKey, m.userId, m.name), { force: true }); } catch { /* ignore */ }
-    }
-    map.clear();
-    for (const g of groups.values()) {
-      for (const content of g.contents) {
-        this.#appendRaw(chatKey, g.userId, g.name, content, now);
-      }
-      const file = memberFile(chatKey, g.userId, g.name);
-      const member = loadMember(chatKey, g.userId, g.name);
-      member.lastConsolidatedAt = now;
-      member.updatedAt = now;
-      writeJson(file, member);
-      map.set(g.userId || `_n_${memberFileName('', g.name)}`, member);
-    }
-    writeJson(metaFile(chatKey), { lastConsolidatedAt: now });
-    const totalAfter = [...map.values()].reduce((n, m) => n + m.impressions.length, 0);
-    return { memberImpression: groups.size ? this.query(chatKey).memberImpression : [], count: totalAfter };
+    const ms = this.members(chatKey).filter((m) => !filter || !m.userId || filter.has(m.userId)).slice(0, filter ? undefined : 15);
+    const label = { reported: '（他人转述）', inferred: '（待核实）', legacy: '（历史印象，缺少原始证据）' };
+    return ms.length ? ['【对群友的印象】', ...ms.flatMap((m) => m.impressions.slice(-3).map((e) => `- ${notes[m.userId] || m.name}：${e.content}${label[e.evidence] || ''}`))].join('\n') : '';
   }
 }
