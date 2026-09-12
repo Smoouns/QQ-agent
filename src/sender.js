@@ -86,6 +86,7 @@ export class SendQueue {
       promises.push(chain(async () => {
         this.#checkRate(chatKey);
         if (gap > 0) await sleep(gap);
+        options.beforeSend?.();
         const data = await this.onebot.sendText(kind, id, text, {
           replyToMessageId: i === 0 ? options.replyToMessageId : null, // 引用挂在第一条上：回的就是那条
           atUserId: i === 0 ? options.atUserId : null
@@ -123,6 +124,7 @@ export class SendQueue {
     return chain(async () => {
       this.#checkRate(chatKey);
       await sleep(randInt(600, 1500)); // 发表情前真人式的短暂停顿
+      options.beforeSend?.();
       const data = await this.onebot.sendSticker(kind, id, sticker.url, {
         replyToMessageId: options.replyToMessageId ?? null,
         atUserId: options.atUserId ?? null
@@ -135,11 +137,12 @@ export class SendQueue {
   }
 
   /** 拍一拍。发送成功后留档（self 记录），否则下一次运行不知道自己拍过。 */
-  poke(chatKey, targetUserId) {
+  poke(chatKey, targetUserId, options = {}) {
     const [kind, id] = String(chatKey).split(':');
     const chain = this.#chain(chatKey);
     return chain(async () => {
       await sleep(randInt(300, 900));
+      options.beforeSend?.();
       const data = await this.onebot.sendPoke(kind, id, targetUserId);
       const ts = Date.now();
       const target = kind === 'group' && targetUserId != null ? ` ${targetUserId}` : '对方';

@@ -17,6 +17,20 @@ const subject = (v) => {
   if (/^(qq:)?\d{1,15}$/.test(s)) return s.startsWith('qq:') ? s : `qq:${s}`;
   throw new Error('人物必须使用数字 QQ 号');
 };
+
+/** Structural evidence checks; semantic relevance is still judged by extraction. */
+export function memoryEvidenceIssue({ kind, subjectIds = [], sources = [], status, evidence }) {
+  if (evidence === 'admin') return '';
+  const hasBot = subjectIds.includes('bot');
+  const humanSource = sources.some((s) => s.senderId !== 'bot' && /^(qq:)?\d{1,15}$/.test(String(s.senderId)));
+  const botSource = sources.some((s) => s.senderId === 'bot');
+  if (hasBot && !['event', 'commitment'].includes(kind)) return '机器人主体仅保存共同事件或明确承诺，不保存自述人设、偏好或普通回应';
+  if (botSource && !humanSource) {
+    if (kind !== 'commitment' || !hasBot) return '不能仅依据机器人发言建立用户事实或共同事件';
+    if (status === 'completed') return '机器人自述不足以证明承诺已完成，需要用户确认的来源';
+  }
+  return '';
+}
 function contentText(v) {
   if (typeof v !== 'string' || !v.trim() || v.length > 2000) throw new Error('内容须为 1–2000 字的文本');
   return v.trim();
@@ -201,8 +215,8 @@ export class MemoryStore {
       const messageMap = new Map(messages.map((m) => [Number(m.id), m]));
       const allowed = new Set([...knownIds.map(subject), ...messages.filter((m) => /^\d{1,15}$/.test(m.senderId)).map((m) => subject(m.senderId)), 'bot']);
       for (const m of messages) if (!m.self && /^\d{1,15}$/.test(m.senderId)) this.#person(db, subject(m.senderId), m.senderName, chatKey);
-      const changed = [];
-      for (const c of candidates) {
+      const changed = [], skipped = [];
+      for (const [index, c] of candidates.entries()) {
         if (c.status === 'deleted') throw new Error('抽取不能删除记忆，请使用被替代或过期状态');
         if (!Array.isArray(c.sourceMessageIds) || !c.sourceMessageIds.length || c.sourceMessageIds.some((id) => !messageMap.has(Number(id)))) throw new Error('记忆引用了批次外的消息');
         const refs = unique(c.sourceMessageIds.map(Number)).map((id) => messageMap.get(id));
@@ -216,14 +230,20 @@ export class MemoryStore {
         if (c.targetId && (!old || !localTo(old, chatKey) || !effective(old) || old.pinned || !sameSubjects(ids, old.subjectIds))) throw new Error('抽取不能修改其他范围、其他人物或固定记忆');
         const content = contentText(c.content);
         const sources = refs.map((m) => ({ chatKey, messageId: m.id, mid: m.mid ?? null, senderId: m.self ? 'bot' : String(m.senderId), ts: m.ts, text: String(m.text || '').slice(0, 4000) }));
+        const status = c.status || old?.status || (c.kind === 'commitment' ? 'pending' : 'active');
+        const issue = memoryEvidenceIssue({ kind: c.kind, subjectIds: ids, sources, status, evidence });
+        if (issue) {
+          skipped.push({ index, targetId: c.targetId || null, reason: issue });
+          continue; // A low-value candidate must not stall the entire cursor batch.
+        }
         // Include tombstones in duplicate checks to avoid resurrecting deletions.
         if (!old && Object.values(db.records).some((r) => r.content === content && r.kind === c.kind && sameSubjects(r.subjectIds, ids) && localTo(r, chatKey))) continue;
         changed.push(this.#put(db, { id: c.targetId, kind: c.kind, content, subjectIds: ids, title: c.title || old?.title || '', eventId: c.eventId || old?.eventId || null,
           visibility: old?.visibility || { type: 'chats', chatKeys: [chatKey] }, evidence, _sources: sources,
-          status: c.status || old?.status || 'active', expiresAt: c.expiresAt ?? old?.expiresAt ?? null }, { actor: 'extractor', expectedVersion: c.targetVersion }));
+          status, expiresAt: c.expiresAt ?? old?.expiresAt ?? null }, { actor: 'extractor', expectedVersion: c.targetVersion }));
       }
       if (advance) db.jobs[chatKey] = { ...prior, cursor: Math.max(cursor, ...messages.map((m) => m.id)), lastSuccessAt: Date.now(), lastError: '', failures: 0 };
-      return { changed: changed.length, records: changed, cursor: db.jobs[chatKey]?.cursor || 0 };
+      return { changed: changed.length, records: changed, skipped, cursor: db.jobs[chatKey]?.cursor || 0 };
     });
   }
   // Compatibility projection: current participant + last three facts, no new recall.

@@ -108,7 +108,7 @@ try {
 
   // 取出渲染函数并执行
   const sections = [
-    'renderSettingsSection', 'renderApiSection', 'renderSearchSection', 'renderMcpSection',
+    'renderSettingsSection', 'renderApiSection', 'renderSearchSection', 'renderMcpSection', 'renderPermissionsSection',
     'renderMemorySettingsSection', 'renderPersonaSection', 'renderAllowSection',
     'renderChatSection', 'renderDesktopSection', 'renderOnebotSection',
     'renderPersonaPicker', 'renderHealthCard'
@@ -145,6 +145,29 @@ try {
       results.push({ name, err: e && e.message });
     }
   }
+
+  // Exercise the actual save handler: a rendered form alone does not verify its HTTP payload.
+  console.log('\n=== 权限设置保存 ===');
+  const savedFetch = sandbox.fetch;
+  try {
+    let posted;
+    sandbox.fetch = async (url, options) => {
+      if (url !== '/api/permissions') return savedFetch(url, options);
+      posted = JSON.parse(options.body);
+      return { ok: true, json: async () => ({ permissions: posted }) };
+    };
+    vm.runInContext(`state.config = ${JSON.stringify(cfg)}; state.settingsSection = 'permissions';`, ctx);
+    document.querySelector('#cfg-admin-qqs').value = '123\n456';
+    document.querySelector('#cfg-admin-style').value = '直接回应 <朋友>';
+    document.querySelector('#cfg-permission-tools').value = '{}';
+    document.querySelector('#cfg-permission-commands').value = '{}';
+    await ctx.saveConfig();
+    if (JSON.stringify(posted.adminQQs) !== '["123","456"]' || posted.adminStyle !== '直接回应 <朋友>') throw new Error('权限保存内容不正确');
+    const html = ctx.renderPermissionsSection({ permissions: posted });
+    if (!html.includes('&lt;朋友&gt;') || !html.includes('/命令名')) throw new Error('权限页面缺少转义或直接命令说明');
+    pass++; console.log('  OK   管理员 QQ、风格和规则通过专用 API 保存，文本正确转义');
+  } catch (e) { fail++; console.log('  FAIL  权限设置保存：' + e.message); }
+  finally { sandbox.fetch = savedFetch; vm.runInContext("state.settingsSection = 'api';", ctx); }
 
   // 滑条换算函数
   console.log('\n=== 滑条换算（UI 侧）===');
@@ -237,21 +260,31 @@ try {
       console.log('  ' + (ok ? 'OK   ' : 'FAIL ') + '四段都能被点亮' + (ok ? '' : '  实际 [' + [...lit].sort().join(',') + ']'));
     }
 
-    // 刻度与参数区一致（亮哪段就亮哪个参数块）
-    // 注意正则要带边界：容器是 tier-params（复数），不能被当前缀匹配进来
+    // Response slider must not change the independent history window control.
     for (const [pos, want] of [[5, 1], [15, 2], [55, 3], [95, 4]]) {
       const html = renderAt(pos);
-      const on = activeSegs(html);
-      const params = [...html.matchAll(/class="tier-param(?!s)([^"]*)"/g)].map((m, i) => ({
-        idx: i + 1, dim: /\bdim\b/.test(m[1])
-      }));
-      const bright = params.filter((x) => !x.dim).map((x) => x.idx);
-      const ok = on[0] === want && bright.length === 1 && bright[0] === want;
+      const ok = activeSegs(html)[0] === want && html.includes('id="cfg-history-count"') &&
+        html.includes('id="cfg-chat-history"') && !html.includes('id="cfg-atcount"');
       ok ? pass++ : fail++;
-      console.log('  ' + (ok ? 'OK   ' : 'FAIL ') + pos + '% 刻度第' + on[0] + '段 / 参数第' + bright.join(',') + '块 一致'
-        + (ok ? '' : '  （期望均为 ' + want + '）'));
+      console.log('  ' + (ok ? 'OK   ' : 'FAIL ') + pos + '% 响应滑条与独立窗口并存');
     }
-
+    {
+      let ok = ctx.parseChatHistoryCounts('group:123=0\nprivate:456=500')['group:123'] === 0;
+      try { ctx.parseChatHistoryCounts('group:123=501'); ok = false; } catch {}
+      try { ctx.parseChatHistoryCounts('abc=80'); ok = false; } catch {}
+      ok ? pass++ : fail++;
+      console.log('  ' + (ok ? 'OK   ' : 'FAIL ') + '会话窗口输入范围与格式校验');
+    }
+    {
+      ctx.renderSessionDetail({ id: 'context-fixture', status: 'done', chatKey: 'group:123', contextSelection: {
+        boundary: 105, historyIds: [100, 101], triggerIds: [105], quoteIds: [2], beforeLocalId: 100,
+        memories: [{ id: 'm_test', version: 2, kind: 'event', reason: '<script>topic</script>' }]
+      } });
+      const html = document.querySelector('#session-detail').innerHTML;
+      const ok = html.includes('2 条历史') && html.includes('m_test v2') && html.includes('&lt;script&gt;') && !html.includes('<script>');
+      ok ? pass++ : fail++;
+      console.log('  ' + (ok ? 'OK   ' : 'FAIL ') + '上下文诊断展示消息边界、记忆版本和转义后的原因');
+    }
 
     // ── 调用明细弹窗（点「调用次数」卡片打开）──
     console.log('\n=== 调用明细弹窗 ===');

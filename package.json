@@ -49,7 +49,10 @@
   "scripts": {
     "start": "electron .",
     "server": "node src/server.js",
-    "test": "node test/selftest.mjs && node test/render-test.mjs && node test/scroll-test.mjs && node test/usage-e2e.mjs && node test/mcp-test.mjs && node test/memory-test.mjs",
+    "test": "node test/selftest.mjs && node test/render-test.mjs && node test/scroll-test.mjs && node test/usage-e2e.mjs && node test/mcp-test.mjs && node test/memory-test.mjs && node test/context-test.mjs && node test/group-members-test.mjs && node test/permissions-test.mjs",
+    "test:permissions": "node test/permissions-test.mjs",
+    "test:context": "node test/context-test.mjs",
+    "test:members": "node test/group-members-test.mjs",
     "test:memory": "node test/memory-test.mjs",
     "test:mcp": "node test/mcp-test.mjs",
     "test:prompt": "node test/test-prompt.mjs",

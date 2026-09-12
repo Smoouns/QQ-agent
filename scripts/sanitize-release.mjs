@@ -74,6 +74,10 @@ function resetConfig() {
   }
 
   const cleared = [];
+  if (cfg.permissions) {
+    cleared.push('permissions');
+    cfg.permissions = { adminQQs: [], adminStyle: '', tools: {}, commands: {} };
+  }
   // MCP 命令、参数、环境变量和请求头均可能包含个人路径或凭据。
   if (cfg.mcp?.servers?.length) {
     cleared.push('mcp.servers');

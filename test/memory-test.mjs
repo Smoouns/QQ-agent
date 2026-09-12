@@ -7,6 +7,7 @@ import { MemoryPipeline, parseMemoryResult } from '../src/memory-pipeline.js';
 import { ChatStore } from '../src/store.js';
 import { DATA_DIR, DEFAULT_CONFIG, setRuntimeConfig } from '../src/config.js';
 import { buildToolDefs } from '../src/tools.js';
+import { recordAllowed } from '../src/context.js';
 
 let count = 0;
 async function check(name, fn) { await fn(); console.log(`✓ ${++count}. ${name}`); }
@@ -218,6 +219,74 @@ await check('带 QQ 消息来源的工具写入与后台抽取共用校验', asy
   const result = await tool.execute({ memory: pipelineMemory, store, chatKey: 'group:1', emit() {} }, { kind: 'event', content: '一起喝茶', subjectIds: ['123'], sourceMessageIds: [91], evidence: 'explicit' });
   assert.ok(!result.isError);
   assert.equal(pipelineMemory.listRecords({ kind: 'event' })[0].sources[0].mid, 91);
+});
+
+const botMemory = new MemoryStore(path.join(DATA_DIR, 'bot-evidence-fixture'));
+const botMsg = { id: 1, mid: 7001, senderId: 'self', senderName: '我', self: true, text: '我爱咖啡，123 也爱咖啡。下次我会帮你继续整理。', ts: 100 };
+const humanMsg = { id: 2, mid: 7002, senderId: '123', senderName: '明', self: false, text: '我喜欢茶，刚才我们一起整理的资料已经收到了。', ts: 101 };
+const botCandidate = (patch = {}) => ({ kind: 'preference', content: '机器人喜欢咖啡', subjectIds: ['bot'], sourceMessageIds: [1], evidence: 'explicit', ...patch });
+await check('bot 普通人设与仅由机器人推断的用户偏好被跳过，有效候选仍写入并推进游标', () => {
+  const out = botMemory.commitExtraction('group:1', [botMsg, humanMsg], [botCandidate(), botCandidate({ subjectIds: ['123'], content: '123 喜欢咖啡' }),
+    botCandidate({ subjectIds: ['123'], content: '123 喜欢茶', sourceMessageIds: [2] })], { cursor: 0 });
+  assert.equal(out.changed, 1); assert.equal(out.skipped.length, 2); assert.equal(out.cursor, 2);
+  assert.deepEqual(out.skipped.map((s) => s.index), [0, 1]);
+  assert.equal(out.records[0].content, '123 喜欢茶');
+});
+let botPromise;
+await check('bot 明确承诺可以保存；共同事件需要用户来源，完成不能仅靠机器人自述', () => {
+  const out = botMemory.commitExtraction('group:1', [botMsg, humanMsg], [
+    botCandidate({ kind: 'commitment', subjectIds: ['bot', '123'], content: '机器人答应下次继续帮123整理', status: 'pending' }),
+    botCandidate({ kind: 'event', content: '机器人与123共同整理资料', subjectIds: ['bot', '123'] }),
+    botCandidate({ kind: 'event', content: '机器人与123共同整理资料，用户确认收到', subjectIds: ['bot', '123'], sourceMessageIds: [1, 2] })
+  ], { advance: false });
+  assert.equal(out.changed, 2); assert.equal(out.skipped.length, 1);
+  botPromise = out.records[0];
+  const defaultPromise = botMemory.commitExtraction('group:1', [botMsg], [botCandidate({ kind: 'commitment', content: '机器人答应下次继续讨论' })], { advance: false });
+  assert.equal(defaultPromise.records[0].status, 'pending');
+  const before = botMemory.getRecord(botPromise.id);
+  const rejected = botMemory.commitExtraction('group:1', [botMsg], [botCandidate({ kind: 'commitment', targetId: botPromise.id, targetVersion: botPromise.version,
+    subjectIds: ['bot', '123'], content: '机器人宣称已经整理完', status: 'completed' })], { advance: false, knownIds: ['123'] });
+  assert.equal(rejected.skipped.length, 1);
+  assert.deepEqual(botMemory.getRecord(botPromise.id), before);
+  const confirmed = botMemory.commitExtraction('group:1', [humanMsg], [botCandidate({ kind: 'commitment', targetId: botPromise.id, targetVersion: botPromise.version,
+    subjectIds: ['bot', '123'], sourceMessageIds: [2], content: '用户确认整理成果已收到', status: 'completed' })], { advance: false });
+  assert.equal(confirmed.records[0].status, 'completed');
+});
+await check('无来源工具写入被拒绝，工具与自动抽取使用相同证据规则', async () => {
+  const t = buildToolDefs().find((x) => x.name === 'memory_append');
+  const chat = 'group:991';
+  const m = store.appendSelf(chat, { text: '我喜欢咖啡', mid: 881 });
+  const ctx = { store, memory: botMemory, chatKey: chat, session: {}, emit() {} };
+  assert.equal((await t.execute(ctx, { userId: '123', content: '无来源印象' })).isError, true);
+  const result = await t.execute(ctx, { kind: 'preference', subjectIds: ['bot'], content: '机器人喜欢咖啡', sourceMessageIds: [881], evidence: 'explicit' });
+  assert.equal(result.isError, true);
+  assert.equal(JSON.parse(result.content).saved, false);
+  assert.equal(botMemory.listRecords({ chatKey: chat }).length, 0);
+  assert.equal(store.findByLocalId(chat, m.id).text, '我喜欢咖啡');
+});
+await check('旧的不合格 bot 记忆退出模型召回，管理端记录与人工确认项保留', () => {
+  const old = { id: 'old_bot', kind: 'fact', content: '机器人自述身份', subjectIds: ['bot'], sources: [{ senderId: 'bot' }],
+    evidence: 'explicit', status: 'active', visibility: { type: 'chats', chatKeys: ['group:1'] } };
+  assert.equal(recordAllowed(old, 'group:1'), false);
+  assert.equal(recordAllowed({ ...old, subjectIds: ['qq:123'], kind: 'preference' }, 'group:1'), false);
+  const admin = botMemory.saveRecord({ kind: 'fact', subjectIds: ['bot'], content: '管理员确认资料', visibility: { type: 'chats', chatKeys: ['group:1'] } });
+  assert.equal(recordAllowed(admin, 'group:1'), true);
+  assert.equal(botMemory.getRecord(admin.id).content, '管理员确认资料');
+});
+await check('后台跳过 bot 普通回应仍保留原文并推进独立抽取游标', async () => {
+  const localStore = new ChatStore();
+  const m = localStore.appendSelf('group:2', { text: '哈哈我也是，我喜欢咖啡' });
+  const mem = new MemoryStore(path.join(DATA_DIR, 'bot-pipeline-fixture'));
+  const p = new MemoryPipeline({ store: localStore, memory: mem, runModel: async (messages) => {
+    assert.ok(JSON.parse(messages[1].content).messages[0].self);
+    return { message: { content: JSON.stringify({ memories: [botCandidate({ sourceMessageIds: [m.id] })] }) } };
+  } });
+  try {
+    const out = await p.run('group:2');
+    assert.equal(out.changed, 0); assert.equal(out.skipped.length, 1);
+    assert.equal(mem.job('group:2').cursor, m.id);
+    assert.equal(localStore.findByLocalId('group:2', m.id).text, m.text);
+  } finally { p.stop(); }
 });
 
 const { createApp } = await import('../src/app.js');

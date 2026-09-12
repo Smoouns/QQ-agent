@@ -12,6 +12,7 @@ export const DATA_DIR = process.env.QQ_AGENT_DATA_DIR || path.join(ROOT, 'data')
 export const CONFIG_FILE = path.join(DATA_DIR, 'config.json');
 
 export const DEFAULT_CONFIG = {
+  permissions: { adminQQs: [], adminStyle: '', tools: {}, commands: {} },
   // OpenAI 兼容 API（必填才能跑）
   api: {
     // 出厂留空：这是作者本机的网关地址，对其他人毫无意义，
@@ -166,12 +167,14 @@ export const DEFAULT_CONFIG = {
     // 单群 JSON 最大保留条数。**0 = 不限制**。
     // 用户明确要求取消上限（原为 2000）。配套措施：
     //   - 前端存档页已分页（首屏 500 条、滚动追加 200 条），不会因数据多而卡
-    //   - store 的 #trim 在 maxPerChat<=0 时直接跳过
+    //   - 存档已移除自动裁剪路径
     // 注意：单群文件会随时间增长，磁盘占用请自行留意。
-    maxMessagesPerChat: 0,
-    // ── 上下文读取档位（决定本次唤醒读多少条历史）──
+    maxMessagesPerChat: 0, // 旧配置兼容字段，存档不再自动裁剪
+    historyCount: 80,           // 独立历史窗口；不含本次新消息，不删除存档
+    chatHistoryCounts: {},     // 可选会话覆盖，如 { 'group:123': 100 }
+    // ── 响应档位（决定何时唤醒）──
     // 档位是"累积生效"的：选 4 档时 1/2/3 档也都生效，按 4→3→2→1 顺序检查，
-    // 第一个命中的决定读取条数。这个设置替代了原来的 pastStateLimit 固定值。
+    // 仅用于响应判定；atCount/keywordCount/randomCount/allCount 保留兼容旧调用，运行窗口使用 historyCount。
     contextTier: 4,             // 1=仅艾特 2=+关键词 3=+随机 4=全读
     atCount: 20,                // 档1：机器人被艾特时读 w 条
     keywordCount: 15,           // 档2：命中关键词时读 x 条

@@ -429,7 +429,7 @@ refs:
 
   // ── 场景 5：群友印象跨运行持久（无状态但记忆保留，且按相关成员注入） ──
   llm.state.script.push(
-    { toolCalls: [{ name: 'memory_append', args: { category: 'memberImpression', userId: 111, target: '张三', content: '张三喜欢聊今晚吃什么' } }, { name: 'send_message', args: { messages: ['记下了'] } }] },
+    { toolCalls: [{ name: 'memory_append', args: { category: 'memberImpression', userId: 111, target: '张三', sourceMessageIds: [9004], evidence: 'explicit', content: '张三喜欢聊今晚吃什么' } }, { name: 'send_message', args: { messages: ['记下了'] } }] },
     { content: 'ok' }
   );
   pushGroupMsg(111, '张三', '帮我记一下张三喜欢聊今晚吃什么', 9004);
@@ -587,7 +587,7 @@ refs:
   llm.state.script.push(
     { toolCalls: [{ name: 'send_poke', args: { targetUserId: '张三' } }] },
     { toolCalls: [{ name: 'get_message_detail', args: { messageId: 999999 } }] },
-    { toolCalls: [{ name: 'get_recent_messages', args: { limit: 10 } }] },
+    { toolCalls: [{ name: 'get_recent_messages', args: { limit: 10, beforeLocalId: app.store.boundary('group:456') + 1 } }] },
     { content: '（知道了）' }
   );
   pushGroupMsg(116, '阿六', '测试工具报错', 9026);

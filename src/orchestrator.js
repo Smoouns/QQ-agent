@@ -2,7 +2,7 @@
 //
 // 流程（对应需求）：
 //   机器人空闲 → 用户发言 → 防抖聚批(wakeDelayMs) → 新开会话（一次独立的 agent 处理）
-//   → 开始时把所有消息标记为已读（触发批作为【本次唤醒】）→ agent 用工具发言/决定不发言
+//   → 固定消息边界和上下文 → agent 用工具发言/决定不发言 → 确认已处理批次
 //   → 会话弃置（不留 LLM 历史）→ 发现 JSON 里有未读 → drainDelayMs 后再新开会话 → …
 //   → 直到没有未读 → 回到空闲。
 //
@@ -17,6 +17,8 @@ import { buildToolDefs, toOpenAiTools, executeTool } from './tools.js';
 import { modelImageVerdict } from './vision-scan.js';
 import { currentProviders } from './providers.js';
 import { MemoryPipeline } from './memory-pipeline.js';
+import { selectWindow, messageAllowed, assertContextAllowed, recallMemories, primarySubjects } from './context.js';
+import { permissions, parseCommand } from './permissions.js';
 
 export class Orchestrator {
   constructor({ store, memory, stickers, sender, sessions, onebot, emit = null, mcp = null }) {
@@ -37,6 +39,7 @@ export class Orchestrator {
     this.consolidating = new Set();    // 正在整理记忆的 chatKey
     this.runningChats = new Set();     // 正在运行的 chatKey
     this.activeRuns = new Map();       // chatKey -> sessionId
+    this.gateRolls = new Map();
     this.runSeq = new Map();           // chatKey -> 第几次处理（跨重启清零即可）
     this.paused = false;
     this.pauseReason = null;
@@ -83,9 +86,12 @@ export class Orchestrator {
    */
   #predictTier(chatKey) {
     const cfg = getConfig();
-    const entries = this.store.peekUnread(chatKey, 200) || [];
+    const entries = (this.store.peekUnread(chatKey, Infinity) || []).filter((m) => messageAllowed(m, chatKey));
+    if (entries.some(parseCommand)) return { tier: 0, reason: '直接命令', shouldRespond: true };
+    if (!this.gateRolls.has(chatKey)) this.gateRolls.set(chatKey, Math.random() * 100);
     const r = resolveContextTier({
       triggerEntries: entries,
+      roll: this.gateRolls.get(chatKey),
       selfNickname: cfg.persona?.selfNickname || this.onebot.selfNickname || '',
       botName: cfg.persona?.botName || '',
       selfId: cfg.onebot?.selfId || this.onebot.selfId || '',
@@ -209,7 +215,7 @@ export class Orchestrator {
     if (this.runningChats.has(chatKey)) return;
 
     // 模型未设置：不产生报错会话，消息保留为未读；设置模型后（下一条消息或手动唤醒）自动补处理
-    if (!String(getConfig().api.model || '').trim()) {
+    if (!String(getConfig().api.model || '').trim() && !this.store.peekUnread(chatKey, Infinity).some(parseCommand)) {
       if (waitingSessionId) this.#finishWaiting(waitingSessionId, 'aborted', '模型未设置');
       return;
     }
@@ -232,62 +238,33 @@ export class Orchestrator {
       return;
     }
 
-    // ── 档位：先判断"这批消息值不值得回应"，再决定要不要取走未读 ──
-    //
-    // 关键顺序：判定必须发生在 drainUnread() 之前。
-    // drainUnread 会把未读取走并全部置为已读（作为触发批），
-    // 如果先取走再判定，未命中时就拿不到"该标记已读"的对象了。
-    //
-    // 未命中时：标记已读、不创建会话、不调模型 —— 这才是省 token 的关键
-    // （消息内容仍留在存档里，日后被艾特时会作为"已读历史"带进提示词）。
-    const cfgNow = getConfig();
-    let pendingEntries = [];
-    if (!proactive) {
-      // peekUnread 只看不取，limit 给足以免漏判（判定用的是这批的文本）
-      pendingEntries = this.store.peekUnread(chatKey, 200) || [];
-      if (pendingEntries.length === 0) {
-        if (waitingSessionId) this.#finishWaiting(waitingSessionId, 'aborted');
-        return; // 没有未读就不空跑
-      }
-
-      // 复用 scheduleWake 那一份判定逻辑，避免两处各写一套、日后漂移
-      const tierResult0 = this.#predictTier(chatKey);
-
-      if (tierResult0.shouldRespond === false) {
-        // 不响应：沉入历史（已读），不产生会话、不消耗 token。
-        // 防抖窗口内后续到达的消息同样是"未读"状态，会在下一次唤醒时
-        // 被一起判定 —— 若期间有人艾特机器人，它们会作为已读上下文带上。
-        const marked = this.store.markAllRead(chatKey);
-        // 关键：让等待会话**干净消失**，而不是标成"中止"留在列表里
-        if (waitingSessionId) this.#discardWaiting(waitingSessionId);
-        this.emit('chat-update', chatKey);
-        if (marked) {
-          console.log(`[orchestrator] ${chatKey} ${marked} 条未命中触发条件（档位 ${tierResult0.tier}），已标记已读、不响应`);
-        }
-        return;
-      }
+    // Fix the batch synchronously before the first await. New arrivals stay unread.
+    const boundary = this.store.boundary(chatKey);
+    const pendingEntries = structuredClone(this.store.peekUnread(chatKey, Infinity));
+    const commandEntry = pendingEntries.find(parseCommand);
+    if (commandEntry) {
+      await this.#runCommand(chatKey, commandEntry, waitingSessionId);
+      return;
     }
-
-    // 触发批：当前所有未读（含之前积压的）—— 到这说明确定要响应了
-    let triggerEntries = proactive ? [] : this.store.drainUnread(chatKey);
-    if (proactive) {
-      // 主动机会：不打扰、无触发批，只带状态
-      this.store.drainUnread(chatKey); // 把可能的零星未读一并处理掉
-    }
-    if (!proactive && triggerEntries.length === 0) {
+    if (pendingEntries.length) proactive = false;
+    if (!proactive && !pendingEntries.length) {
       if (waitingSessionId) this.#finishWaiting(waitingSessionId, 'aborted');
-      return; // 没有未读就不空跑
+      return;
     }
-
-    // ── 档位：响应时带多少条已读历史 ──
-    // 在唤醒时算一次并固定下来（尤其是随机档的骰子结果），
-    // 否则后续每次渲染提示词都会重新掷，会话记录与提示词会对不上。
-    const tierResult = resolveContextTier({
-      triggerEntries,
-      selfNickname: cfgNow.persona?.selfNickname || this.onebot.selfNickname || '',
-      botName: cfgNow.persona?.botName || '',
-      selfId: cfgNow.onebot?.selfId || this.onebot.selfId || '',
-      cfg: storeConfigForChat(chatKey)   // 与 #predictTier 同一来源，保证预判/实跑一致
+    const tierResult = proactive ? { tier: 0, reason: '主动机会', shouldRespond: true } : this.#predictTier(chatKey);
+    this.gateRolls.delete(chatKey);
+    if (!tierResult.shouldRespond) {
+      this.store.acknowledge(chatKey, pendingEntries.map((m) => m.id));
+      if (waitingSessionId) this.#discardWaiting(waitingSessionId);
+      this.emit('chat-update', chatKey);
+      return;
+    }
+    const window = selectWindow(this.store, chatKey, proactive ? [] : pendingEntries, { boundary });
+    const triggerEntries = window.trigger;
+    const selectedMemories = recallMemories(this.memory, chatKey, {
+      query: triggerEntries.map((m) => m.text).join('\n'),
+      secondary: [...window.history.slice(-8), ...window.quotes].map((m) => m.text).join('\n'),
+      subjectIds: primarySubjects(triggerEntries.length ? triggerEntries : window.history.slice(-3), this.store, chatKey)
     });
 
     this.runningChats.add(chatKey);
@@ -330,7 +307,8 @@ export class Orchestrator {
     try {
       for (let attempt = 1; attempt <= MAX_SESSION_ATTEMPTS; attempt++) {
         try {
-          await this.#runAgent(session, { kind, chatId, chatKey, triggerEntries, proactive, seq, contextLimit: tierResult.count, tierInfo: tierResult });
+          const completed = await this.#runAgent(session, { kind, chatId, chatKey, triggerEntries, proactive, seq, window, selectedMemories, contextLimit: window.limit, tierInfo: tierResult });
+          if (completed) this.store.acknowledge(chatKey, pendingEntries.map((m) => m.id));
           lastError = null;
           break;
         } catch (error) {
@@ -339,6 +317,7 @@ export class Orchestrator {
           const canRetry = attempt < MAX_SESSION_ATTEMPTS
             && isRetryableError(error)
             && sentCount === 0
+            && !session.sideEffectAttempted
             && !session.externalToolAttempted
             && !this.aborted;
           if (!canRetry) break;
@@ -361,6 +340,10 @@ export class Orchestrator {
         console.error(`[orchestrator] 运行 ${session.id} 出错:`, lastError);
       }
     } finally {
+      // An uncertain external action must never be automatically replayed.
+      if (session.sideEffectAttempted || session.externalToolAttempted || session.sent.length) {
+        this.store.acknowledge(chatKey, pendingEntries.map((m) => m.id));
+      }
       this.activeRuns.delete(chatKey);
       this.runningChats.delete(chatKey);
       this.emit('chat-update', chatKey);
@@ -369,7 +352,7 @@ export class Orchestrator {
     // drain：运行期间来的新消息 → 再次新开会话处理（这是"确保看到所有发言"的关键）
     if (!this.aborted && !this.paused) {
       const unread = this.store.unreadCount(chatKey);
-      if (unread > 0) {
+      if (unread > 0 && this.store.peekUnread(chatKey, Infinity).some((m) => m.id > boundary)) {
         const drainDelay = Math.max(200, Number(getConfig().drainDelayMs) || 1200);
         this.scheduleWake(chatKey, drainDelay);
       }
@@ -377,6 +360,64 @@ export class Orchestrator {
 
     // 记忆自动整理（后台静默，绝不阻塞/影响聊天主流程）
     this.memoryPipeline.schedule(chatKey);
+  }
+
+  async #runCommand(chatKey, entry, waitingSessionId) {
+    if (waitingSessionId) this.#discardWaiting(waitingSessionId);
+    this.gateRolls.delete(chatKey);
+    const session = this.sessions.create({ chatKey, trigger: [entry], triggerSummary: `命令 ${parseCommand(entry).name} · QQ ${entry.senderId}` });
+    session.command = { name: parseCommand(entry).name, actorQQ: entry.senderId, sourceMessageId: entry.mid, sourceLocalId: entry.id };
+    const window = selectWindow(this.store, chatKey, [entry], { limit: 0 });
+    session.contextSelection = { boundary: window.boundary, beforeLocalId: entry.id, blocklist: window.blocklist,
+      historyIds: [], triggerIds: [entry.id], quoteIds: [], interleavedIds: [], memories: [] };
+    this.runningChats.add(chatKey);
+    this.activeRuns.set(chatKey, session.id);
+    this.emit('session-start', { sessionId: session.id, chatKey, triggerSummary: session.triggerSummary });
+    // Persist consumption before external actions. A crash cannot replay the command.
+    this.store.acknowledge(chatKey, [entry.id]);
+    const [kind, chatId] = chatKey.split(':');
+    const ctx = { chatKey, kind, chatId, store: this.store, memory: this.memory, stickers: this.stickers,
+      sender: this.sender, onebot: this.onebot, mcp: this.mcp, session, selfId: this.onebot.selfId,
+      botName: getConfig().persona.botName, selfNickname: this.onebot.selfNickname,
+      isCancelled: () => this.paused || this.aborted,
+      emit: (type, payload) => this.emit(type, payload) };
+    try {
+      if (!messageAllowed(entry, chatKey)) throw new Error('此 QQ 已被屏蔽');
+      const result = await permissions.command(ctx, entry, async () => {
+        const cfg = getConfig();
+        const vision = cfg.api.vision !== false && modelImageVerdict(cfg.api.provider, cfg.api.model) !== 'no-vision';
+        const defs = this.toolDefs.filter((d) => (kind === 'group' || d.name !== 'get_group_members')
+          && (vision || !['get_message_images', 'get_sticker_image'].includes(d.name))
+          && (cfg.webSearch?.enabled !== false || !['web_search', 'web_fetch'].includes(d.name)));
+        if (this.mcp) defs.push(...(await this.mcp.toolDefsForChat(chatKey)).defs);
+        return defs;
+      });
+      session.finishReason = result.reply;
+      const sent = await this.sender.sendTextBatch(chatKey, [result.reply], { replyToMessageId: entry.mid,
+        beforeSend: () => { if (!messageAllowed(entry, chatKey)) throw new Error('此 QQ 已被屏蔽'); } });
+      session.sent.push(...sent.sent);
+      this.sessions.finish(session.id, result.isError ? 'error' : 'done');
+    } catch (error) {
+      session.error = String(error.message);
+      session.feedbacks.push({ level: 'error', message: session.error, at: Date.now() });
+      // No tool output or internal failure details are published to the chat.
+      if (messageAllowed(entry, chatKey) && !/频繁/.test(session.error)) {
+        try {
+          const reply = session.sideEffectAttempted ? '命令处理未完成，请在控制台核对执行结果。' : '命令未执行：请检查 /权限、/帮助 或控制台记录。';
+          const sent = await this.sender.sendTextBatch(chatKey, [reply], { replyToMessageId: entry.mid,
+            beforeSend: () => { if (!messageAllowed(entry, chatKey)) throw new Error('此 QQ 已被屏蔽'); } });
+          session.sent.push(...sent.sent);
+        } catch { /* Keep the original command error. Never retry the action. */ }
+      }
+      this.sessions.finish(session.id, 'error');
+    } finally {
+      this.activeRuns.delete(chatKey);
+      this.runningChats.delete(chatKey);
+      this.emit('session-end', { sessionId: session.id, chatKey });
+      this.emit('chat-update', chatKey);
+      if (!this.aborted && !this.paused && this.store.unreadCount(chatKey)) this.scheduleWake(chatKey, Math.max(200, Number(getConfig().drainDelayMs) || 1200));
+      this.memoryPipeline.schedule(chatKey);
+    }
   }
 
   /**
@@ -401,20 +442,16 @@ export class Orchestrator {
     this.emit('session-update', session.id);
   }
 
-  async #runAgent(session, { kind, chatId, chatKey, triggerEntries, proactive, seq, contextLimit = null, tierInfo = null }) {
+  async #runAgent(session, { kind, chatId, chatKey, triggerEntries, proactive, seq, window, selectedMemories, contextLimit = null, tierInfo = null }) {
     const cfg = getConfig();
     const chatName = kind === 'group' ? await this.#chatName(chatId) : '';
     const selfNickname = kind === 'group' ? (cfg.persona.selfNickname || this.onebot.selfNickname || cfg.persona.botName) : cfg.persona.botName;
 
-    // 上下文统计
-    const tenMinAgo = Date.now() - 600000;
-    const recentCount = this.store.recent(chatKey, { limit: 200 }).filter((m) => m.ts >= tenMinAgo).length;
-    const myMessages = this.store.recent(chatKey, { limit: 100 }).filter((m) => m.self);
-    const selfLastMessageAt = myMessages.length ? myMessages[myMessages.length - 1].ts : 0;
-    const lastMessageAt = (() => {
-      const all = this.store.recent(chatKey, { limit: 10 });
-      return all.length ? all[all.length - 1].ts : Date.now();
-    })();
+    const snapshotMessages = [...window.history, ...window.interleaved, ...window.trigger].sort((a, b) => a.id - b.id);
+    const now = window.createdAt;
+    const recentCount = snapshotMessages.filter((m) => m.ts >= now - 600000).length;
+    const selfLastMessageAt = snapshotMessages.findLast((m) => m.self)?.ts || 0;
+    const lastMessageAt = snapshotMessages.at(-1)?.ts || now;
 
     // 表情库快照（提示词用）
     let stickerEntries = [];
@@ -423,8 +460,9 @@ export class Orchestrator {
     }
 
     // 组装提示词（无 LLM 历史）
-    const systemPrompt = buildSystemPrompt();
-    const userPrompt = buildUserPrompt({
+    const systemPrompt = (session.contextSelection ? session.systemPrompt : buildSystemPrompt({ entries: [...snapshotMessages, ...window.quotes] }));
+    const userPrompt = (session.contextSelection ? session.userPrompt : buildUserPrompt({
+      window, selectedMemories, now, session, selfId: this.onebot.selfId,
       chatKey, kind, chatId, chatName,
       triggerEntries,
       store: this.store,
@@ -439,8 +477,8 @@ export class Orchestrator {
       proactive,
       contextLimit,
       tierInfo
-    });
-
+    }));
+    assertContextAllowed(session, this.memory, chatKey);
     session.systemPrompt = systemPrompt;
     session.userPrompt = userPrompt;
     session.promptChars = systemPrompt.length + userPrompt.length;
@@ -452,7 +490,7 @@ export class Orchestrator {
     // 记录本次读了多长的上下文（排查提示词长度时很有用）
     if (tierInfo) {
       session.contextTier = tierInfo.tier;
-      session.contextLimit = tierInfo.count;
+      session.contextLimit = contextLimit;
       session.contextReason = tierInfo.reason || '';
     }
     this.sessions.update(session.id);
@@ -460,9 +498,7 @@ export class Orchestrator {
 
     const messages = [
       { role: 'system', content: systemPrompt },
-      { role: 'user', content: proactive
-        ? `${userPrompt}\n\n【本次唤醒】（主动机会）群里已经安静了一会儿。你可以主动抛一个自然的话题（像随口说的，不要像播报），也可以判断没必要说话就安静结束。`
-        : userPrompt }
+      { role: 'user', content: userPrompt }
     ];
     // JSON 模式需要看到输入给模型的完整 messages（去工具之前）
     session.inputMessages = structuredClone(messages.map((m) => ({ role: m.role, content: m.content })));
@@ -474,6 +510,7 @@ export class Orchestrator {
       && modelImageVerdict(cfg.api.provider, cfg.api.model) !== 'no-vision';
     const searchEnabled = cfg.webSearch?.enabled !== false;
     const toolDefs = this.toolDefs.filter((d) => {
+      if (kind !== 'group' && d.name === 'get_group_members') return false;
       if (!visionEnabled && (d.name === 'get_message_images' || d.name === 'get_sticker_image')) return false;
       if (!searchEnabled && (d.name === 'web_search' || d.name === 'web_fetch')) return false;
       return true;
@@ -486,7 +523,8 @@ export class Orchestrator {
         session.feedbacks.push(...external.warnings.map((message) => ({ level: 'warning', message: `MCP：${message}`, at: Date.now() })));
       }
     }
-    const openAiTools = toOpenAiTools(toolDefs);
+    const availableDefs = toolDefs.filter((d) => permissions.visible(d, chatKey));
+    const openAiTools = toOpenAiTools(availableDefs);
 
     const ctx = {
       chatKey, kind, chatId,
@@ -514,14 +552,16 @@ export class Orchestrator {
       this.emit('session-update', session.id);
     };
     for (let round = 0; round < maxRounds && !finish; round++) {
-      if (this.aborted) { this.sessions.finish(session.id, 'aborted'); return; }
+      if (this.aborted) { this.sessions.finish(session.id, 'aborted'); return false; }
+      assertContextAllowed(session, this.memory, chatKey);
       markActivity('正在思考…');
       // 网络抖动/5xx/429 会自动重试（同一轮请求，messages 不变，幂等不重复发言）
-      const response = await chatCompletionWithRetry({ messages, tools: openAiTools });
+      const response = await chatCompletionWithRetry({ messages, tools: openAiTools, beforeRequest: () => assertContextAllowed(session, this.memory, chatKey) });
       session.model = response.model || session.model;
       addUsage(session.usage, response.usage);
       session.usage.calls += 1;
 
+      assertContextAllowed(session, this.memory, chatKey);
       const msg = response.message;
       const finalContent = typeof msg.content === 'string' ? msg.content : (msg.content ?? null);
       const finalToolCalls = Array.isArray(msg.tool_calls) && msg.tool_calls.length ? msg.tool_calls : undefined;
@@ -580,12 +620,14 @@ export class Orchestrator {
         if (!lastAssistantUi.tool_calls) lastAssistantUi.tool_calls = structuredClone(toolCalls);
       }
       for (const call of toolCalls) {
+        assertContextAllowed(session, this.memory, chatKey);
         const name = call?.function?.name ?? '';
+        if (['send_message', 'send_sticker', 'send_poke', 'memory_append', 'memory_remove', 'collect_sticker', 'sticker_note'].includes(name)) session.sideEffectAttempted = true;
         const argsRaw = call?.function?.arguments ?? '{}';
         if (name === 'web_search' || name === 'web_fetch') webSearchCount += 1;
         session.webSearchCount = webSearchCount;
         markActivity(`正在调用 ${name}…`);
-        const result = await executeTool(toolDefs, ctx, name, argsRaw);
+        const result = await executeTool(availableDefs, ctx, name, argsRaw);
         // 工具结果：文本走 tool 消息；图片（parts 数组）不能塞进 tool 消息——
         // 很多 OpenAI 兼容端点不接受。做法：tool 消息只带文本，图片随后以 user 消息补发
         // （[{type:'text'},{type:'image_url'}]），这是兼容面最广的视觉输入方式。
@@ -620,6 +662,7 @@ export class Orchestrator {
     }
 
     // 收尾：发过话 = done；没发 = noreply（这是正常选项）
+    assertContextAllowed(session, this.memory, chatKey);
     const status = session.error ? 'error' : (session.sent.length > 0 ? 'done' : 'noreply');
     this.sessions.finish(session.id, status);
     this.emit('session-end', {
@@ -630,6 +673,7 @@ export class Orchestrator {
       finishReason: session.finishReason,
       usage: session.usage
     });
+    return true;
   }
 
   /**

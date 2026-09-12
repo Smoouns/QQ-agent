@@ -92,6 +92,13 @@ try {
     assert.equal(result.isError, false);
     assert.match(result.content, /echo:HTTP/);
   });
+  await check('MCP 真正发送前执行权限复查，旧服务配置不能借新连接执行', async () => {
+    const before = calls.length;
+    const denied = await manager.call(service.id, 'find.item', { text: 'denied' }, 'group:1', () => { throw new Error('管理员权限已撤销'); });
+    assert.equal(denied.isError, true); assert.match(denied.content, /管理员权限已撤销/);
+    assert.equal((await manager.call(service.id, 'find.item', { text: 'stale' }, 'group:1', null, 'old-version')).isError, true);
+    assert.equal(calls.length, before);
+  });
   await check('工具错误与结果字符上限', async () => {
     assert.equal((await manager.call(service.id, 'error', {}, 'group:1')).isError, true);
     const result = await manager.call(service.id, 'large', {}, 'group:1');

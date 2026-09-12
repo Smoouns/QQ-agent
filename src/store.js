@@ -31,8 +31,11 @@ function loadChat(chatKey) {
     let text = fs.readFileSync(chatFile(chatKey), 'utf8');
     if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1);
     const parsed = JSON.parse(text);
-    if (parsed && Array.isArray(parsed.messages)) return parsed;
-  } catch { /* 新会话 */ }
+    if (parsed && Array.isArray(parsed.messages) && Number.isInteger(parsed.nextLocalId) && parsed.nextLocalId > 0) return parsed;
+    throw new Error(`聊天存档格式错误：${chatKey}`);
+  } catch (error) {
+    if (error.code !== 'ENOENT') throw error; // Never overwrite a damaged archive as an empty chat.
+  }
   return { chatKey, nextLocalId: 1, messages: [] };
 }
 
@@ -44,6 +47,7 @@ function saveChat(state) {
 }
 
 export class ChatStore {
+  // maxPerChat/setMaxPerChat remain compatible with old startup code; no trimming.
   constructor(maxPerChat = 0) {
     this.maxPerChat = Math.max(0, Number(maxPerChat) || 0);
     this.chats = new Map(); // chatKey -> state
@@ -78,8 +82,13 @@ export class ChatStore {
   }
 
   /** 追加一条收到的消息（未读）。返回写入的条目。 */
-  appendIncoming(chatKey, { mid, ts, senderId, senderName, text, reply = null, media = [] }) {
+  appendIncoming(chatKey, { mid, ts, senderId, senderName, text, reply = null, media = [], mentions = [], commandText = null }) {
     const st = this.#state(chatKey);
+    // OneBot reconnects may replay a command. Keep its original handled state.
+    if (commandText !== null && mid != null) {
+      const existing = st.messages.find((m) => !m.self && String(m.mid) === String(mid));
+      if (existing) return existing;
+    }
     const entry = {
       id: st.nextLocalId++,
       mid: mid ?? null,
@@ -87,13 +96,15 @@ export class ChatStore {
       senderId: String(senderId ?? ''),
       senderName: String(senderName ?? ''),
       text: String(text ?? ''),
+      commandText,
+      receivedAt: Date.now(),
       self: false,
       read: false,
       reply: reply || null,
+      mentions: Array.isArray(mentions) ? mentions.map(String) : [],
       media: Array.isArray(media) ? media : []
     };
     st.messages.push(entry);
-    this.#trim(st);
     saveChat(st);
     return entry;
   }
@@ -114,7 +125,6 @@ export class ChatStore {
       media: []
     };
     st.messages.push(entry);
-    this.#trim(st);
     saveChat(st);
     return entry;
   }
@@ -167,6 +177,23 @@ export class ChatStore {
     return all.slice(0, start).slice(-Math.max(1, Number(limit) || 1));
   }
 
+  /** Read-only snapshot boundary. Local IDs never depend on later arrivals. */
+  boundary(chatKey) { return this.#state(chatKey).nextLocalId - 1; }
+
+  before(chatKey, beforeLocalId, { limit = 80, offset = 0, accept = () => true } = {}) {
+    const all = this.#state(chatKey).messages.filter((m) => m.id < beforeLocalId && accept(m));
+    const end = Math.max(0, all.length - Math.max(0, Math.floor(Number(offset) || 0)));
+    const count = Math.max(0, Math.floor(Number(limit) || 0));
+    return structuredClone(all.slice(Math.max(0, end - count), end));
+  }
+
+  acknowledge(chatKey, ids) {
+    const selected = new Set(ids);
+    const st = this.#state(chatKey);
+    for (const m of st.messages) if (selected.has(m.id)) m.read = true;
+    saveChat(st);
+  }
+
   findByMid(chatKey, mid) {
     const st = this.#state(chatKey);
     const target = String(mid);
@@ -183,7 +210,10 @@ export class ChatStore {
     const target = String(mid);
     const m = st.messages.find((x) => String(x.mid) === target);
     if (!m) return false;
-    if (text != null) m.text = String(text);
+    if (text != null) {
+      m.originalText ??= m.text;
+      m.text = String(text);
+    }
     if (appendMedia.length) {
       m.media = Array.isArray(m.media) ? m.media : [];
       const seen = new Set(m.media.map((x) => x && x.url));
@@ -230,9 +260,4 @@ export class ChatStore {
     return [...map.values()].sort((a, b) => b.lastTs - a.lastTs).slice(0, Math.max(1, limit));
   }
 
-  #trim(st) {
-    if (this.maxPerChat > 0 && st.messages.length > this.maxPerChat) {
-      st.messages.splice(0, st.messages.length - this.maxPerChat);
-    }
-  }
 }

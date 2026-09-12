@@ -4,6 +4,8 @@
 //
 // 工具命名去掉了 qq_ 前缀（更短，省 token）。
 import { getConfig } from './config.js';
+import { permissions } from './permissions.js';
+import { messageAllowed, recordAllowed, recallMemories, rememberAccess, assertContextAllowed, blockedIds } from './context.js';
 import { normalizeMessageList, unquoteJsonString } from './util.js';
 import { formatStickerList } from './stickers.js';
 import { validateImageUrl, safeFetchBinary } from './safe-fetch.js';
@@ -35,9 +37,49 @@ function err(message) {
   return { content: `错误：${message}`, isError: true };
 }
 
+// One roster snapshot per run: no full roster in persisted sessions or prompts.
+const groupRosters = new WeakMap();
+const compareQQ = (a, b) => a.length - b.length || a.localeCompare(b, 'en');
+
+async function groupRoster(ctx) {
+  const owner = ctx.session || ctx;
+  const cached = groupRosters.get(owner);
+  if (cached?.chatKey === ctx.chatKey) return cached.members;
+  const groupId = ctx.chatKey.slice('group:'.length);
+  const result = await ctx.onebot.call('get_group_member_list', { group_id: Number(groupId) });
+  const list = Array.isArray(result) ? result : result?.data;
+  if (!Array.isArray(list)) throw new Error('OneBot 返回的群成员列表格式错误');
+  const unique = new Map();
+  for (const m of list) {
+    const userId = String(m?.user_id ?? '');
+    if (!/^[1-9]\d{0,14}$/.test(userId)) continue;
+    unique.set(userId, { userId, nickname: String(m.nickname || ''), card: String(m.card || '') });
+  }
+  const members = [...unique.values()].sort((a, b) => compareQQ(a.userId, b.userId));
+  groupRosters.set(owner, { chatKey: ctx.chatKey, members });
+  return members;
+}
+
+function visibleMessages(ctx, limit = 80) {
+  return ctx.store.before(ctx.chatKey, (ctx.session?.contextSelection?.boundary ?? ctx.store.boundary(ctx.chatKey)) + 1,
+    { limit, accept: (m) => messageAllowed(m, ctx.chatKey) });
+}
+function visibleEntry(ctx, mid) {
+  const m = ctx.store.findByMid(ctx.chatKey, mid);
+  return m && m.id <= (ctx.session?.contextSelection?.boundary ?? Infinity) && messageAllowed(m, ctx.chatKey) ? m : null;
+}
+function visibleMembers(ctx, limit) {
+  const members = new Map();
+  for (const m of visibleMessages(ctx, Infinity)) {
+    if (m.self) continue;
+    members.set(m.senderId, { userId: m.senderId, name: m.senderName, lastTs: m.ts, count: (members.get(m.senderId)?.count || 0) + 1 });
+  }
+  return [...members.values()].sort((a, b) => b.lastTs - a.lastTs).slice(0, limit);
+}
+
 // 找不到消息 id 时，把当前会话真实可见的 id 告诉模型，避免它继续瞎猜。
 function midHint(ctx) {
-  const mids = ctx.store.recent(ctx.chatKey, { limit: 60 })
+  const mids = visibleMessages(ctx, 60)
     .map((m) => m.mid)
     .filter((v) => v !== null && v !== undefined && String(v) !== '');
   const uniq = [...new Set(mids.map(String))].slice(-8);
@@ -48,7 +90,7 @@ function midHint(ctx) {
 
 // 需要数字 QQ 号但模型传了名字时，把当前会话真实可见的成员列出来，让它选一个。
 function memberHint(ctx) {
-  const members = ctx.store.activeMembers(ctx.chatKey, 8);
+  const members = visibleMembers(ctx, 8);
   if (!members.length) return '当前没有可用的成员列表，请先等有群友发言后再试';
   const lines = members.map((m) => `- ${m.name}：${m.userId}`).join('\n');
   return `请从当前会话成员里选一个 QQ 号填进去：\n${lines}`;
@@ -87,6 +129,7 @@ export function buildToolDefs() {
           const messages = normalizeMessageList(args.messages);
           if (!messages.length) return err('消息内容为空');
           const result = await ctx.sender.sendTextBatch(ctx.chatKey, messages, {
+            beforeSend: () => { assertContextAllowed(ctx.session, ctx.memory, ctx.chatKey); ctx.assertToolAuthorized?.(); },
             replyToMessageId: args.replyToMessageId ?? null,
             atUserId: args.atUserId ?? null
           });
@@ -123,6 +166,7 @@ export function buildToolDefs() {
             return err(`表情 ${sticker.id} 的图片地址不合法，已拒绝发送：${error?.message ?? error}`);
           }
           const result = await ctx.sender.sendSticker(ctx.chatKey, sticker, {
+            beforeSend: () => { assertContextAllowed(ctx.session, ctx.memory, ctx.chatKey); ctx.assertToolAuthorized?.(); },
             replyToMessageId: args.replyToMessageId ?? null,
             atUserId: args.atUserId ?? null
           });
@@ -210,7 +254,7 @@ export function buildToolDefs() {
       },
       async execute(ctx, args) {
         try {
-          const entry = ctx.store.findByMid(ctx.chatKey, args.messageId);
+          const entry = visibleEntry(ctx, args.messageId);
           if (!entry) return err(`在当前会话找不到消息 ${args.messageId}。${midHint(ctx)}`);
           const imageMedia = (entry.media || []).find((m) => m.kind === 'image' && m.url);
           if (!imageMedia) return err('该消息没有可收藏的图片');
@@ -239,9 +283,9 @@ export function buildToolDefs() {
             if (!Number.isInteger(target) || target <= 0) {
               return err(`targetUserId 必须是正整数的 QQ 号（收到：${JSON.stringify(args.targetUserId)}）。${memberHint(ctx)}`);
             }
-            await ctx.sender.poke(ctx.chatKey, target);
+            await ctx.sender.poke(ctx.chatKey, target, { beforeSend: () => { assertContextAllowed(ctx.session, ctx.memory, ctx.chatKey); ctx.assertToolAuthorized?.(); } });
           } else {
-            await ctx.sender.poke(ctx.chatKey, null);
+            await ctx.sender.poke(ctx.chatKey, null, { beforeSend: () => { assertContextAllowed(ctx.session, ctx.memory, ctx.chatKey); ctx.assertToolAuthorized?.(); } });
           }
           return ok({ poked: true });
         } catch (error) {
@@ -256,17 +300,25 @@ export function buildToolDefs() {
         type: 'object',
         properties: {
           limit: { type: 'integer', description: '最多返回条数，默认 30，最大 100' },
-          offset: { type: 'integer', description: '跳过最近 N 条，用于翻更早的消息' }
+          offset: { type: 'integer', description: '兼容参数：从固定历史边界跳过 N 条；推荐使用返回的游标' },
+          beforeLocalId: { type: 'integer', description: '上一页返回的 nextBeforeLocalId；省略时从提示词历史窗口之前开始' }
         }
       },
       async execute(ctx, args) {
         const limit = Math.min(100, Math.max(1, Number(args.limit) || 30));
         const offset = Math.max(0, Number(args.offset) || 0);
-        const messages = ctx.store.recent(ctx.chatKey, { limit, offset: offset + (ctx.session.pastStateCount || 0) });
+        const selection = ctx.session.contextSelection;
+        const boundary = selection?.boundary ?? ctx.store.boundary(ctx.chatKey);
+        const requested = Number(args.beforeLocalId);
+        if (args.beforeLocalId != null && (!Number.isInteger(requested) || requested < 1)) return err('beforeLocalId 必须是正整数');
+        const before = Math.min(boundary + 1, args.beforeLocalId == null ? (selection?.beforeLocalId ?? boundary + 1) : requested);
+        const messages = ctx.store.before(ctx.chatKey, before, { limit, offset, accept: (m) => messageAllowed(m, ctx.chatKey) });
         return ok({
           count: messages.length,
+          nextBeforeLocalId: messages[0]?.id ?? null,
+          hasMore: messages.length > 0 && ctx.store.before(ctx.chatKey, messages[0].id, { limit: 1, accept: (m) => messageAllowed(m, ctx.chatKey) }).length > 0,
           messages: messages.map((m) => ({
-            messageId: m.mid ?? undefined,
+            messageId: m.mid ?? undefined, localId: m.id, senderId: m.self ? 'bot' : m.senderId,
             time: new Date(m.ts).toLocaleString('zh-CN', { hour12: false, month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }),
             sender: m.self ? '我' : m.senderName,
             text: m.text
@@ -286,7 +338,7 @@ export function buildToolDefs() {
       },
       async execute(ctx, args) {
         try {
-          const entry = ctx.store.findByMid(ctx.chatKey, args.messageId);
+          const entry = visibleEntry(ctx, args.messageId);
           if (!entry) return err(`当前会话找不到消息 ${args.messageId}。${midHint(ctx)}`);
           // 存档里已是展开文本（收消息时已展开/之前展开过）→ 直接给，不再请求 QQ
           if (String(entry.text || '').startsWith('[合并转发 共')) {
@@ -306,13 +358,13 @@ export function buildToolDefs() {
     },
     {
       name: 'get_active_members',
-      description: '查看当前会话最近活跃的成员（QQ 号、名字、最近发言时间、发言数），用于 @ 或拍一拍时找人。',
+      description: '从当前会话的聊天存档查看最近活跃的成员（QQ 号、名字、最近发言时间、发言数）。没有发言记录的人请用 get_group_members 查询。',
       parameters: {
         type: 'object',
         properties: { limit: { type: 'integer', description: '默认 10，最大 20' } }
       },
       async execute(ctx, args) {
-        const members = ctx.store.activeMembers(ctx.chatKey, Math.min(20, Math.max(1, Number(args.limit) || 10)));
+        const members = visibleMembers(ctx, Math.min(20, Math.max(1, Number(args.limit) || 10)));
         return ok({
           members: members.map((m) => ({
             userId: m.userId,
@@ -324,6 +376,41 @@ export function buildToolDefs() {
       }
     },
     {
+      name: 'get_group_members',
+      description: '查询当前群的成员 QQ 号、昵称和群名片，包括未在聊天存档中发言的人。query 搜索昵称/群名片/QQ号，userId 精确查 QQ 号；同名时保留全部候选，不能只凭昵称认定身份。分页时保持查询条件不变，将 nextAfterUserId 传给 afterUserId。仅群聊可用，不能指定其他群。',
+      parameters: {
+        type: 'object', additionalProperties: false,
+        properties: {
+          query: { type: 'string', maxLength: 100, description: '可选：昵称、群名片或 QQ 号的一部分，不区分英文大小写' },
+          userId: { type: 'string', pattern: '^[1-9][0-9]{0,14}$', description: '可选：精确查询这个 QQ 号' },
+          limit: { type: 'integer', minimum: 1, maximum: 100, description: '每页条数，默认 20，最多 100' },
+          afterUserId: { type: 'string', pattern: '^[1-9][0-9]{0,14}$', description: '上一页返回的 nextAfterUserId；首次查询省略' }
+        }
+      },
+      async execute(ctx, args) {
+        if (ctx.kind !== 'group' || !/^group:[1-9]\d{0,14}$/.test(ctx.chatKey)) return err('此工具仅用于当前群聊，私聊中无法查询群成员');
+        if (!args || typeof args !== 'object' || Array.isArray(args) || Object.keys(args).some((k) => !['query', 'userId', 'limit', 'afterUserId'].includes(k))) return err('不支持这些参数；群号由当前会话自动绑定');
+        if (args.query != null && (typeof args.query !== 'string' || args.query.length > 100)) return err('query 必须是最多 100 字的字符串');
+        for (const key of ['userId', 'afterUserId']) if (args[key] != null && (typeof args[key] !== 'string' || !/^[1-9]\d{0,14}$/.test(args[key]))) return err(`${key} 必须是有效 QQ 号字符串`);
+        const limit = args.limit ?? 20;
+        if (!Number.isInteger(limit) || limit < 1 || limit > 100) return err('limit 必须是 1–100 的整数');
+        try {
+          const roster = await groupRoster(ctx);
+          // Read the live blocklist after the network request and on every page.
+          const blocked = blockedIds(ctx.chatKey);
+          const query = String(args.query || '').trim().toLowerCase();
+          const matches = roster.filter((m) => !blocked.has(m.userId) && (!args.userId || m.userId === args.userId) &&
+            (!query || [m.userId, m.nickname, m.card].some((s) => s.toLowerCase().includes(query))));
+          const remaining = matches.filter((m) => !args.afterUserId || compareQQ(m.userId, args.afterUserId) > 0);
+          const members = remaining.slice(0, limit);
+          const hasMore = remaining.length > members.length;
+          return ok({ total: matches.length, count: members.length, members, hasMore,
+            nextAfterUserId: hasMore ? members.at(-1).userId : null,
+            note: '成员列表为本次运行首次查询时的快照，下一次运行重新获取；同名候选请结合 QQ 号或上下文确认。' });
+        } catch (error) { return err(`获取群成员失败：${error?.message ?? error}`); }
+      }
+    },
+    {
       name: 'get_message_detail',
       description: '按 QQ 消息 id 查看单条消息详情（完整文本、发送者、时间）。id 用聊天记录里每条消息前的 #数字，不要自己编。',
       parameters: {
@@ -332,7 +419,7 @@ export function buildToolDefs() {
         required: ['messageId']
       },
       async execute(ctx, args) {
-        const entry = ctx.store.findByMid(ctx.chatKey, args.messageId);
+        const entry = visibleEntry(ctx, args.messageId);
         if (!entry) return err(`当前会话找不到消息 ${args.messageId}。${midHint(ctx)}`);
         return ok({
           messageId: entry.mid,
@@ -354,7 +441,7 @@ export function buildToolDefs() {
       },
       async execute(ctx, args) {
         try {
-          const entry = ctx.store.findByMid(ctx.chatKey, args.messageId);
+          const entry = visibleEntry(ctx, args.messageId);
           if (!entry) return err(`当前会话找不到消息 ${args.messageId}。${midHint(ctx)}`);
           const urls = (entry.media || []).filter((m) => m.kind === 'image' && m.url).map((m) => m.url);
           if (!urls.length) return ok(`消息 ${args.messageId} 没有可查看的图片`);
@@ -373,7 +460,7 @@ export function buildToolDefs() {
     },
     {
       name: 'memory_append',
-      description: '保存事实、偏好、关系、共同事件或承诺，或按 targetId/targetVersion 更新已有记录。必须准确区分说话人与主体；多人事件只写一份。sourceMessageIds 填原始 QQ 消息 ID。记录仅限当前会话，固定记忆不可修改。未提供来源的旧式调用只保存为待核实的事实。',
+      description: '保存事实、偏好、关系、共同事件或承诺，或按 targetId/targetVersion 更新已有记录。必须准确区分说话人与主体；多人事件只写一份。sourceMessageIds 填原始 QQ 消息 ID。记录仅限当前会话，固定记忆不可修改。所有写入必须提供来源；机器人主体只记事件或承诺，用户事实需要用户消息依据。',
       parameters: {
         type: 'object',
         properties: {
@@ -390,53 +477,68 @@ export function buildToolDefs() {
           targetVersion: { type: 'integer', description: '更新前的版本号' },
           content: { type: 'string', description: '记忆内容或事件经过（最多2000字，准确、独立可理解）' }
         },
-        required: ['content']
+        required: ['content', 'sourceMessageIds']
       },
       async execute(ctx, args) {
         if (Array.isArray(args.sourceMessageIds) && args.sourceMessageIds.length) {
           try {
             if (args.sourceMessageIds.some((id) => !/^-?\d+$/.test(String(id)))) return err('sourceMessageIds 必须是数字 QQ 消息 ID');
-            const messages = args.sourceMessageIds.map((id) => ctx.store.findByMid(ctx.chatKey, id));
+            const messages = args.sourceMessageIds.map((id) => visibleEntry(ctx, id));
             if (messages.some((m) => !m)) return err('来源消息不存在于当前会话');
             const result = ctx.memory.commitExtraction(ctx.chatKey, messages, [{ ...args, kind: args.kind || 'fact',
               subjectIds: args.subjectIds || [String(args.userId || '')], evidence: args.evidence || 'inferred',
               sourceMessageIds: messages.map((m) => m.id) }], { advance: false,
-              knownIds: ctx.store.activeMembers(ctx.chatKey, 300).map((p) => p.userId).filter((id) => /^\d{1,15}$/.test(id)) });
+              knownIds: visibleMembers(ctx, 300).map((p) => p.userId).filter((id) => /^\d{1,15}$/.test(id)) });
             ctx.emit?.('memory-update', { chatKey: ctx.chatKey });
-            return ok({ saved: true, ...result });
+            return result.skipped.length ? { ...ok({ saved: false, ...result }), isError: true } : ok({ saved: true, ...result });
           } catch (error) { return err(error.message); }
         }
-        if (args.targetId || (args.kind && args.kind !== 'fact') || args.subjectIds) return err('此类记忆必须提供 sourceMessageIds');
-        const userId = String(args.userId ?? '').trim();
-        if (!/^\d{1,15}$/.test(userId)) {
-          return err(`userId 必须是数字 QQ 号（收到：${JSON.stringify(args.userId)}）。先用 get_active_members 查准确 QQ 号再记。`);
-        }
-        const entry = ctx.memory.append(ctx.chatKey, 'memberImpression', String(args.content ?? ''), {
-          userId,
-          target: String(args.target ?? '').trim()
-        });
-        ctx.emit?.('memory-update', { chatKey: ctx.chatKey });
-        return ok({ saved: true, entry });
+        return err('记忆写入必须提供 sourceMessageIds；用户事实需引用用户原话，不能凭机器人自述或无来源推测保存');
       }
     },
     {
       name: 'memory_query',
-      description: '查看当前会话可见的记忆及其 ID、版本、状态，以便后续写入更新。可传 userId 按 QQ 号过滤；不包含其他群或私聊的专属记忆。',
+      description: '搜索当前会话可见的记忆。用 query 按话题检索、userId 按 QQ 人物筛选、eventId 查关联记录；用 recordId 展开详情和本会话原始证据，includeHistory 可查看仍可见的旧版本。不搜索其他会话的专属内容。',
       parameters: {
         type: 'object',
         properties: {
-          userId: { type: ['integer', 'string'], description: '可选：只看这个 QQ 号的印象' }
+          userId: { type: ['integer', 'string'], description: 'QQ 号' },
+          query: { type: 'string', description: '话题关键词，可换词重查' },
+          recordId: { type: 'string', description: '展开指定记忆' },
+          eventId: { type: 'string', description: '查这个事件及其关联记录' },
+          includeHistory: { type: 'boolean', description: '展开详情时附上可见的旧版本' },
+          limit: { type: 'integer', description: '默认 20，最大 50' }
         }
       },
       async execute(ctx, args) {
-        const mem = ctx.memory.query(ctx.chatKey);
         const userId = String(args.userId ?? '').trim();
-        const list = userId
-          ? mem.memberImpression.filter((e) => String(e.userId) === userId)
-          : mem.memberImpression;
-        const records = ctx.memory.listRecords({ chatKey: ctx.chatKey, personId: userId }).slice(0, 100)
-          .map(({ id, kind, content, subjectIds, status, version, pinned, title, evidence }) => ({ id, kind, content, subjectIds, status, version, pinned, title, evidence }));
-        return ok({ memberImpression: list, records });
+        if (userId && !/^\d{1,15}$/.test(userId)) return err('userId 必须是 QQ 号');
+        const limit = Math.min(50, Math.max(1, Number(args.limit) || 20));
+        const publicRecord = (r) => {
+          const { id, kind, content, subjectIds, status, version, pinned, title, evidence, eventId, updatedAt } = r;
+          return { id, kind, content, subjectIds, status, version, pinned, title, evidence, eventId, updatedAt };
+        };
+        if (args.recordId) {
+          const r = ctx.memory.getRecord(String(args.recordId));
+          if (!recordAllowed(r, ctx.chatKey)) return err('当前会话找不到可见的有效记忆');
+          const versions = args.includeHistory ? r.history.filter((v) => recordAllowed(v, ctx.chatKey, { historical: true })) : [];
+          rememberAccess(ctx.session, [r, ...versions]);
+          const sources = (v) => (v.sources || []).filter((src) => src.chatKey === ctx.chatKey && messageAllowed({ senderId: src.senderId }, ctx.chatKey));
+          return ok({ record: { ...publicRecord(r), sources: sources(r), history: versions.map((v) => ({ ...publicRecord(v), sources: sources(v) })) } });
+        }
+        let records = ctx.memory.listRecords({ chatKey: ctx.chatKey, personId: userId }).filter((r) => recordAllowed(r, ctx.chatKey));
+        if (args.eventId) {
+          const event = ctx.memory.getRecord(String(args.eventId));
+          if (!recordAllowed(event, ctx.chatKey)) return err('当前会话找不到可见事件');
+          records = records.filter((r) => r.id === event.id || r.eventId === event.id);
+        }
+        if (String(args.query || '').trim()) {
+          const selected = recallMemories({ listRecords: () => records }, ctx.chatKey, { query: args.query, limit, personLimit: 0, topicLimit: limit });
+          records = selected.map((x) => x.record);
+        }
+        records = records.slice(0, limit);
+        rememberAccess(ctx.session, records);
+        return ok({ records: records.map(publicRecord), memberImpression: records.filter((r) => r.kind === 'fact').map((r) => ({ id: r.id, userId: r.subjectIds[0]?.replace(/^qq:/, ''), content: r.content })) });
       }
     },
     {
@@ -562,7 +664,7 @@ export async function executeTool(defs, ctx, name, argsJson) {
     return { content: `错误：工具 ${name} 的参数不是合法 JSON：${String(raw).slice(0, 200)}`, isError: true };
   }
   try {
-    return await def.execute(ctx, args ?? {});
+    return await permissions.execute(ctx, def, args ?? {});
   } catch (error) {
     return { content: `错误：${error?.message ?? error}`, isError: true };
   }

@@ -15,6 +15,7 @@ import { StickerManager } from './sticker-manager.js';
 import { SendQueue } from './sender.js';
 import { SessionRegistry } from './sessions.js';
 import { Orchestrator } from './orchestrator.js';
+import { directCommandText, normalizePermissions } from './permissions.js';
 import { McpManager, publicMcpServer } from './mcp.js';
 import { listModels, chatCompletion, resolveApiKey, estimateCost, cacheHitRate } from './llm.js';
 import { resolveOfficialPrice, listOfficialPrices, isPeakHour, priceAt, resolveModelPrice, modelLabel, splitModelLabel, UNKNOWN_VENDOR } from './model-prices.js';
@@ -426,7 +427,7 @@ export function createApp({ log = console.log } = {}) {
       } else if (typeof msg?.message === 'string') {
         text = msg.message;
       }
-      return { sender: String(senderName), text: String(text).slice(0, 120) };
+      return { mid: String(messageId), senderId: String(msg?.sender?.user_id || ''), sender: String(senderName), text: String(text).slice(0, 120) };
     } catch {
       return null;
     }
@@ -437,7 +438,7 @@ export function createApp({ log = console.log } = {}) {
     if (!allowed(kind, id, cfgNow)) return; // 白名单外的聊天完全不记录
 
     const segments = Array.isArray(event.message) ? event.message : null;
-    const senderId = String(event.sender?.user_id ?? event.user_id ?? '');
+    const senderId = String(event.user_id ?? event.sender?.user_id ?? '');
     const senderName = String(event.sender?.card || event.sender?.nickname || senderId || '');
 
     // 屏蔽名单：被屏蔽群员的消息直接丢弃 —— 不存档、不触发会话、不进提示词背景。
@@ -446,9 +447,10 @@ export function createApp({ log = console.log } = {}) {
     const media = segments ? extractMediaFromSegments(segments) : [];
 
     let text;
+    let reply = null;
     if (segments) {
       text = await segmentsToText(segments, {
-        resolveReply: (mid) => resolveReply(mid),
+        resolveReply: async (mid) => { reply = await resolveReply(mid) || { mid }; return reply; },
         resolveAtName: (qq) => kind === 'group' ? resolveAtName(id, qq) : null
       });
     } else {
@@ -481,6 +483,9 @@ export function createApp({ log = console.log } = {}) {
       senderId,
       senderName,
       text: text || '[图片]' ,
+      commandText: directCommandText(event.message),
+      reply,
+      mentions: (segments || []).filter((s) => s.type === 'at' && /^\d+$/.test(s.data?.qq)).map((s) => String(s.data.qq)),
       media
     });
     emit('chat-update', `${kind}:${id}`);
@@ -702,6 +707,19 @@ export function createApp({ log = console.log } = {}) {
       if (!authorize(req)) return json(res, 401, { error: '未授权' });
       const method = req.method;
       const cfgNow = getConfig();
+
+      if (pathname === '/api/permissions') {
+        if (!keyEndpointAllowed(req)) return json(res, 403, { error: '请从本机控制台管理权限' });
+        try {
+          if (method === 'GET') return json(res, 200, { permissions: cfgNow.permissions });
+          if (method === 'POST') {
+            const permissions = normalizePermissions(await readBody(req));
+            updateConfig({ permissions: { __replace__: permissions } });
+            return json(res, 200, { permissions });
+          }
+          return json(res, 405, { error: '不支持的请求方法' });
+        } catch (error) { return json(res, 400, { error: String(error.message) }); }
+      }
 
       if (pathname.startsWith('/api/memory/') || pathname.startsWith('/api/memory-files')) {
         if (!keyEndpointAllowed(req)) return json(res, 403, { error: '请从本机控制台管理记忆' });
@@ -1247,6 +1265,7 @@ export function createApp({ log = console.log } = {}) {
 
       if (pathname === '/api/config' && method === 'POST') {
         const patch = await readBody(req);
+        if ('permissions' in patch) return json(res, 400, { error: '请通过专用权限接口修改权限' });
         if ('mcp' in patch) return json(res, 400, { error: 'MCP 配置请通过工具页面保存' });
         const next = updateConfig(patch);
         store.setMaxPerChat(next.store?.maxMessagesPerChat ?? 0);

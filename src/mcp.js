@@ -285,12 +285,14 @@ export class McpManager {
           if (t.unavailableReason) { warnings.push(`${s.name}/${t.name}：${t.unavailableReason}`); continue; }
           defs.push({
             name: t.modelName,
+            permissionKey: `mcp:${s.id}:${t.name}`,
+            authorizationVersion: e.fingerprint,
             description: `[外部工具：${s.name}] ${t.description || t.name}`,
             parameters: t.inputSchema,
             async execute(ctx, args) {
               // 在任何可能的外部副作用前设置；整轮重试不能重复执行外部动作。
               ctx.session.externalToolAttempted = true;
-              return ctx.mcp.call(s.id, t.name, args, ctx.chatKey);
+              return ctx.mcp.call(s.id, t.name, args, ctx.chatKey, ctx.assertToolAuthorized, e.fingerprint);
             }
           });
         }
@@ -301,16 +303,18 @@ export class McpManager {
     return { defs: defs.slice(0, 64), warnings };
   }
 
-  async call(id, name, args, chatKey) {
+  async call(id, name, args, chatKey, beforeCall = null, expectedVersion = null) {
     const s = this.get(id);
     if (!chatAllowed(this.config(), chatKey) || !allowed(s, chatKey) || !s.enabledTools.includes(name)) return { content: '错误：当前聊天未获准使用该 MCP 工具', isError: true };
     try {
       const e = await this.ensure(id);
       const live = this.get(id);
       if (!chatAllowed(this.config(), chatKey) || !allowed(live, chatKey) || !live.enabledTools.includes(name) || fingerprint(live) !== e.fingerprint) throw new Error('工具配置已变更，本次调用取消');
+      if (expectedVersion !== null && expectedVersion !== e.fingerprint) throw new Error('工具配置已变化，请重新发起调用');
       const tool = e.tools.find((t) => t.name === name);
       if (!tool || tool.unavailableReason) throw new Error(tool?.unavailableReason || '服务已不再提供该工具');
       if (!object(args) || !tool.validate(args)) throw new Error(`工具参数不符合 Schema：${this.ajv.errorsText(tool.validate.errors)}`);
+      beforeCall?.();
       const result = await e.client.callTool({ name, arguments: args }, undefined, requestOptions(s));
       return formatMcpResult(result, s.maxResultChars);
     } catch (error) {

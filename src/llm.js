@@ -113,6 +113,7 @@ export function isRetryableError(error) {
 export async function chatCompletionWithRetry(args, retries = 2) {
   let lastError = null;
   for (let attempt = 0; attempt <= retries; attempt++) {
+    args.beforeRequest?.();
     try {
       return await chatCompletion(args);
     } catch (error) {

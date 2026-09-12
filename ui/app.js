@@ -815,7 +815,7 @@ function renderSessionDetail(s) {
   if (!detail) return;
   // 内容没变（轮询/SSE 重复推送）→ 完全不动 DOM，保住滚动位置和展开状态
   // json 模式切换也要触发重渲染
-  const fp = `${s.id}|${s.status}|${s.rounds || 0}|${(s.messages || []).length}|${(s.sent || []).length}|${s.error ? 1 : 0}|${s.activity || ''}|${state.sessionJsonMode === s.id ? 'json' : 'ui'}`;
+  const fp = `${s.id}|${s.status}|${s.rounds || 0}|${(s.messages || []).length}|${(s.sent || []).length}|${s.error ? 1 : 0}|${s.activity || ''}|${state.sessionJsonMode === s.id ? 'json' : 'ui'}|${s.contextSelection?.boundary ?? ''}`;
   if (lastDetailFp === fp) return;
   const firstRender = lastDetailFp === null;
   lastDetailFp = fp;
@@ -843,6 +843,14 @@ function renderSessionDetail(s) {
       </div>
     </div>`);
 
+  if (s.command || s.permissionAudit?.length) {
+    html.push(`<details class="collapsible"><summary>权限与命令记录</summary><div class="coll-body">${esc(JSON.stringify({ command: s.command || null, audit: s.permissionAudit || [], results: s.command ? s.messages : undefined }, null, 2))}</div></details>`);
+  }
+  if (s.contextSelection) {
+    const c = s.contextSelection;
+    html.push(`<details class="collapsible"><summary>上下文选取：${c.historyIds.length} 条历史 · ${c.triggerIds.length} 条新消息 · ${c.memories.length} 条记忆</summary>
+      <div class="coll-body">${esc(`存档边界：${c.boundary}\n历史 local ID：${c.historyIds.join(', ')}\n新消息 local ID：${c.triggerIds.join(', ')}\n引用补充：${c.quoteIds.join(', ') || '无'}\n批次期间已读消息：${(c.interleavedIds || []).join(', ') || '无'}\n翻页游标：${c.beforeLocalId}\n` + c.memories.map((m) => `${m.id} v${m.version}（${m.kind}）：${m.reason}`).join('\n'))}</div></details>`);
+  }
   const jsonMode = state.sessionJsonMode === s.id;
   if (jsonMode) {
     // JSON 模式：原模原样展示输入给模型的内容 + 模型返回的原始内容
@@ -852,6 +860,10 @@ function renderSessionDetail(s) {
       model: s.model || '',
       systemPrompt: s.systemPrompt || '',
       userPrompt: s.userPrompt || '',
+      contextSelection: s.contextSelection || null,
+      command: s.command || null,
+      permissionAudit: s.permissionAudit || [],
+      commandResults: s.command ? s.messages : [],
       inputMessages: (s.inputMessages || []).map((m) => ({ role: m.role, content: m.content })),
       llmMessages: (s.messages || []).filter((m) => m.role === 'assistant').map((m) => ({
         role: m.role,
@@ -883,7 +895,7 @@ function renderSessionDetail(s) {
     if (s.userPrompt) {
       html.push(`
         <details class="collapsible" open>
-          <summary>本次输入（${s.userPrompt.length} 字符 —— 零对话历史，全部来自 JSON 存档）</summary>
+          <summary>本次输入（${s.userPrompt.length} 字符 —— 聊天窗口与相关记忆）</summary>
           <div class="coll-body">${esc(s.userPrompt)}</div>
         </details>`);
     }
@@ -2523,6 +2535,7 @@ function renderSettingsSidebar() {
     ['api', '模型 API'],
     ['search', '搜索服务'],
     ['mcp', '工具（MCP）'],
+    ['permissions', '权限与命令'],
     ['memory', '记忆'],
     ['persona', '人设'],
     ['allow', '聊天白名单'],
@@ -2572,6 +2585,7 @@ function renderSettingsSection(c) {
   const sections = {
     api: () => renderApiSection(c),
     search: () => renderSearchSection(c),
+    permissions: () => renderPermissionsSection(c),
     memory: () => renderMemorySettingsSection(c),
     persona: () => renderPersonaSection(c),
     allow: () => renderAllowSection(c),
@@ -2586,6 +2600,22 @@ function renderSettingsSection(c) {
       <span id="cfg-save-result" class="muted"></span>
     </div>
     ${render()}`;
+}
+
+function renderPermissionsSection(c) {
+  const p = c.permissions || {};
+  return `<h3>权限与命令</h3>
+    <div class="field"><label>机器人管理员 QQ</label><textarea id="cfg-admin-qqs" rows="3" placeholder="一行一个 QQ 号">${esc((p.adminQQs || []).join('\n'))}</textarea>
+      <div class="hint">按真实 QQ 号识别，在群聊和私聊中一致。QQ群主、群管理员、昵称和记忆不会授予此权限。</div></div>
+    <div class="field"><label>对管理员的交互风格</label><textarea id="cfg-admin-style" rows="4" maxlength="2000" placeholder="例如：称呼我为阿默；回答我的问题更直接，可以保持熟悉的玩笑语气。">${esc(p.adminStyle || '')}</textarea>
+      <div class="hint">只影响说话方式。普通聊天不会调用受限工具，也不会扩大记忆的可见范围。</div></div>
+    <div class="hint">直接发送 /帮助、/权限。注册后的命令使用 /命令名，可附带 JSON 参数。需要确认时，机器人会给出本次参数及 /确认 编号；可用 /取消 编号取消。确认仅在原会话对本人有效，两分钟后失效。</div>
+    <details class="collapsible"><summary>注册命令与工具规则（高级）</summary><div class="coll-body">
+      <div class="field"><label>工具规则 JSON</label><textarea id="cfg-permission-tools" rows="12" spellcheck="false">${esc(JSON.stringify(p.tools || {}, null, 2))}</textarea>
+        <div class="hint">工具 ID：builtin:工具名，或 mcp:服务ID:原始工具名。role 为 public / admin / disabled。可设置 chats（会话列表；空列表表示全部禁止）、maxCallsPerMinute、confirm，以及 argsSchema 参数约束。未单独配置的现有工具维持原有开放范围。</div></div>
+      <div class="field"><label>命令注册 JSON</label><textarea id="cfg-permission-commands" rows="8" spellcheck="false">${esc(JSON.stringify(p.commands || {}, null, 2))}</textarea>
+        <div class="hint">例如 {"查成员":{"tool":"builtin:get_group_members","description":"查询当前群成员"}}，同时须为该工具配置 {"role":"admin"}。命令名不含 /。受限工具未注册命令时不可从聊天调用。当前没有重启、禁言等管理工具。</div></div>
+    </div></details>`;
 }
 
 function renderApiSection(c) {
@@ -3191,23 +3221,17 @@ return `
       </div>
     </div>
 
-    <div class="tier-params">
-      <div class="tier-param${curTier === 1 ? '' : ' dim'}">
-        <label>① 被艾特时：发未读 + <input type="number" id="cfg-atcount" min="0" max="500" value="${esc(st.atCount ?? 20)}" /> 条已读</label>
-        <div class="hint">有人 @机器人时才响应。<b>任何档位下被艾特都会响应</b>。</div>
-      </div>
-      <div class="tier-param${curTier === 2 ? '' : ' dim'}">
-        <label>② 命中关键词时：发未读 + <input type="number" id="cfg-kwcount" min="0" max="500" value="${esc(st.keywordCount ?? 15)}" /> 条已读</label>
-        <div class="hint">关键词（每行一个，不区分大小写）：</div>
-        <textarea id="cfg-keywords" rows="3" placeholder="小鲸鱼&#10;bot">${esc((st.keywords || []).join('\n'))}</textarea>
-      </div>
-      <div class="tier-param${curTier === 3 ? '' : ' dim'}">
-        <label>③ 随机命中时：发未读 + <input type="number" id="cfg-randcount" min="0" max="500" value="${esc(st.randomCount ?? 8)}" /> 条已读</label>
-      </div>
-      <div class="tier-param${curTier >= 4 ? '' : ' dim'}">
-        <label>④ 其余情况也响应：发未读 + <input type="number" id="cfg-allcount" min="0" max="500" value="${esc(st.allCount ?? 80)}" /> 条已读</label>
-        <div class="hint"><b>任何消息都响应</b>。</div>
-      </div>
+    <div class="field"><label>关键词（每行一个，关键词档位及以上生效）</label>
+      <textarea id="cfg-keywords" rows="3">${esc((st.keywords || []).join('\n'))}</textarea>
+    </div>
+    <h3>聊天窗口</h3>
+    <div class="field"><label>历史消息条数</label>
+      <input type="number" id="cfg-history-count" min="0" max="500" value="${esc(st.historyCount ?? 80)}" />
+      <div class="hint">每次发送最近 N 条历史 + 本次全部新消息。响应档位只控制何时回应；完整聊天存档始终保留。窗口不按天截断，之前运行的工具输出不带入。</div>
+    </div>
+    <div class="field"><label>单独设置会话窗口（可选，每行一个）</label>
+      <textarea id="cfg-chat-history" rows="3" placeholder="group:123456=100&#10;private:123456=60">${esc(Object.entries(st.chatHistoryCounts || {}).map(([key, count]) => `${key}=${count}`).join('\n'))}</textarea>
+      <div class="hint">格式：group:群号=条数 或 private:QQ号=条数；留空跟随上方设置，范围 0–500。</div>
     </div>
 
     <h3>屏蔽名单</h3>
@@ -3215,6 +3239,16 @@ return `
       <button class="btn btn-small" id="blocklist-btn">管理屏蔽名单</button>
       <div class="hint" style="margin-top:6px">被屏蔽群员的消息不会存档、不会触发回复，也不会作为聊天背景发给模型。机器人自己的发言不受影响。</div>
     </div>`;
+}
+
+function parseChatHistoryCounts(text) {
+  const out = {};
+  for (const line of String(text).split('\n').map((v) => v.trim()).filter(Boolean)) {
+    const m = /^(group|private):(\d{1,15})\s*=\s*(\d+)$/.exec(line);
+    if (!m || Number(m[3]) > 500) throw new Error('会话窗口格式错误，请使用 group:群号=0–500 或 private:QQ号=0–500');
+    out[`${m[1]}:${m[2]}`] = Number(m[3]);
+  }
+  return out;
 }
 
 function renderDesktopSection(c) {
@@ -3377,7 +3411,7 @@ function bindSettingsEvents(c) {
     }
   });
 
-  // ── 响应档位滑条：拖动时即时反馈（档位 + 概率 + 参数高亮）──
+  // ── 响应档位滑条：拖动时即时反馈（档位 + 概率）──
   // ⚠️ 档位的唯一真相是滑条的 value（DOM 实时值），不用全局变量记录 ——
   //   曾经用过 window.__ctxTier，结果每次重渲染重新绑定事件时被"未保存的旧配置"
   //   无条件覆盖（选了 2 档，切走再切回就变回 4 档），还踩了 `|| 4` 的 falsy 陷阱。
@@ -3389,13 +3423,6 @@ function bindSettingsEvents(c) {
       // 提示行：显示当前档位与概率
       const note = $('#ctx-tier-note');
       if (note) note.innerHTML = sliderDesc(pos);
-      // 参数区高亮：只点亮"当前真正会用到的那一档"
-      // 1档→只亮①；2档→亮②；3档→亮③；4档→亮④（且①②③失效）
-      const params = document.querySelectorAll('.tier-param');
-      params.forEach((el, idx) => {
-        const n = idx + 1;
-        el.classList.toggle('dim', n !== t);
-      });
       // 刻度段高亮：滑到哪一档，那一档的标签 + 上边线一起变色。
       // ⚠️ 之前这段完全没做，颜色全靠 CSS 写死（.s1 永远亮、.s4 永远橙），
       //    所以拖动滑条时刻度毫无反应 —— 看起来就像"没生效"。
@@ -4465,6 +4492,16 @@ async function saveConfig({ quiet = false } = {}) {
 
   const patch = {};
 
+  if (sec === 'permissions') {
+    const result = await api('/api/permissions', { method: 'POST', body: JSON.stringify({
+      adminQQs: parseList(val('#cfg-admin-qqs')), adminStyle: val('#cfg-admin-style'),
+      tools: JSON.parse(val('#cfg-permission-tools', '{}')), commands: JSON.parse(val('#cfg-permission-commands', '{}'))
+    }) });
+    state.config.permissions = result.permissions;
+    if (!quiet) $('#cfg-save-result').textContent = '已保存';
+    return;
+  }
+
   if (sec === 'memory') {
     patch.memory = {
       ...(c.memory || {}),
@@ -4644,13 +4681,10 @@ async function saveConfig({ quiet = false } = {}) {
         const pos = sl ? Number(sl.value) : (c.store?.contextSliderPos ?? 100);
         return sliderToTierUI(pos).randomPercent;
       })(),
-      atCount: clampInt(val('#cfg-atcount', c.store?.atCount), 1, 500, 20),
-      keywordCount: clampInt(val('#cfg-kwcount', c.store?.keywordCount), 1, 500, 15),
+      historyCount: clampInt(val('#cfg-history-count', c.store?.historyCount), 0, 500, 80),
+      chatHistoryCounts: { __replace__: parseChatHistoryCounts($('#cfg-chat-history')?.value || '') },
       keywords: String($('#cfg-keywords')?.value || '')
         .split('\n').map((x) => x.trim()).filter(Boolean),
-      randomPercent: clampInt(val('#cfg-randpct', c.store?.randomPercent), 0, 100, 10),
-      randomCount: clampInt(val('#cfg-randcount', c.store?.randomCount), 1, 500, 8),
-      allCount: clampInt(val('#cfg-allcount', c.store?.allCount), 1, 500, 80),
       // 统一开关 + 分群滑条表（__replace__：删掉的群设置要真删，深合并做不到）
       unifiedTier: chk('#cfg-unifiedtier', c.store?.unifiedTier !== false),
       groupSliderPos: {
