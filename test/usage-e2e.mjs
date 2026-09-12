@@ -1,6 +1,7 @@
 // 真实端到端：起真服务，**不 mock 任何接口**，
 // 用 vm 加载 ui/app.js，走完整的 switchTab('usage') → loadUsageView 流程，
 // 验证页面真的有内容。这是最接近用户实际操作的验证。
+import './isolated-env.mjs';
 import fs from 'node:fs';
 import vm from 'node:vm';
 import path from 'node:path';
@@ -16,8 +17,8 @@ const check = (n, c, e = '') => { if (c) { pass++; console.log('  OK   ' + n); }
 
 // ── 起真服务 ──
 const app = createApp({ log: () => {} });
-const PORT = 40995;
-const port = await app.start(PORT);
+// 只启动 HTTP 接口，不启动真实 OneBot、SnowLuma 或遥测。
+const port = await new Promise((resolve) => app.server.listen(0, '127.0.0.1', () => resolve(app.server.address().port)));
 console.log('=== 真实服务已启动 :' + port + '（接口全部真实，无 mock）===\n');
 
 // ── DOM 桩（尽量接近真实）──

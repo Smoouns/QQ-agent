@@ -18,6 +18,19 @@
    注意：:root 与 [data-theme='dark'] 写在同一条规则里，"默认"和"显式选暗色"共用一套值。
    不要再把 :root 单独拆出来写（曾经拆出过一个只有 color-scheme 的 :root 块，
    既冗余又容易让人误以为变量定义在别处）。 */
+.mcp-toolbar { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin: 16px 0; }
+.mcp-toolbar select { flex: 1; min-width: 180px; padding: 8px 10px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg-2); color: var(--text); }
+.mcp-status { display: flex; flex-direction: column; gap: 8px; margin: 18px 0; }
+.mcp-json { font-family: var(--mono); min-height: 80px; }
+.mcp-tools { display: grid; gap: 12px; }
+.mcp-tool { padding: 16px; border: 1px solid var(--border); border-radius: 10px; background: var(--bg-2); overflow-wrap: anywhere; }
+.mcp-tool p { color: var(--muted); font-size: 13px; white-space: pre-wrap; }
+.mcp-tool details { margin: 12px 0; }
+.mcp-tool pre, .mcp-result { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 320px; overflow: auto; font: 12px/1.6 var(--mono); }
+.mcp-tool .mcp-error { color: var(--red); }
+#mcp-notice { white-space: pre-wrap; overflow-wrap: anywhere; }
+#mcp-editor[aria-busy="true"] button { opacity: .6; pointer-events: none; }
+
 :root,
 [data-theme='dark'] {
   color-scheme: dark;

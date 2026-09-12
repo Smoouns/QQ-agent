@@ -74,6 +74,11 @@ function resetConfig() {
   }
 
   const cleared = [];
+  // MCP 命令、参数、环境变量和请求头均可能包含个人路径或凭据。
+  if (cfg.mcp?.servers?.length) {
+    cleared.push('mcp.servers');
+    cfg.mcp = { servers: [] };
+  }
   const set = (obj, key, val) => {
     if (obj && key in obj && obj[key] !== val) { obj[key] = val; cleared.push(key); }
   };

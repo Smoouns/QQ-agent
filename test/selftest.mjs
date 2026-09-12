@@ -1235,15 +1235,17 @@ refs:
     assert.equal(sliderToTier(NaN).tier, 4, 'NaN 应回落到 4 档');
 
     // 后端权威派生：只传滑条位置，后端应算出档位与概率
-    const { updateConfig } = await import('../src/config.js');
+    const { updateConfig, getConfig, setRuntimeConfig, CONFIG_FILE } = await import('../src/config.js');
     const fs2 = await import('node:fs');
-    const backup = fs2.readFileSync('data/config.json', 'utf8');
+    const backup = fs2.readFileSync(CONFIG_FILE, 'utf8');
+    const runtimeBackup = structuredClone(getConfig());
     try {
       const n = updateConfig({ store: { contextSliderPos: 55 } });
       assert.equal(n.store.contextTier, 3, '后端应把 55% 派生为 3 档');
       assert.ok(Math.abs(n.store.randomPercent - 50) < 1, '后端应把 55% 派生为 50% 概率');
     } finally {
-      fs2.writeFileSync('data/config.json', backup, 'utf8');
+      fs2.writeFileSync(CONFIG_FILE, backup, 'utf8');
+      setRuntimeConfig(runtimeBackup);
     }
     pass('响应档位滑条：分区 + 概率线性 + 后端权威派生');
   }

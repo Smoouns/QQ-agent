@@ -15,6 +15,7 @@ import { StickerManager } from './sticker-manager.js';
 import { SendQueue } from './sender.js';
 import { SessionRegistry } from './sessions.js';
 import { Orchestrator } from './orchestrator.js';
+import { McpManager, publicMcpServer } from './mcp.js';
 import { listModels, chatCompletion, resolveApiKey, estimateCost, cacheHitRate } from './llm.js';
 import { resolveOfficialPrice, listOfficialPrices, isPeakHour, priceAt, resolveModelPrice, modelLabel, splitModelLabel, UNKNOWN_VENDOR } from './model-prices.js';
 import { initPriceFeed, refreshPriceFeed, priceFeedStatus } from './price-feed.js';
@@ -285,7 +286,8 @@ export function createApp({ log = console.log } = {}) {
     onebot, store,
     onSent: ({ chatKey, text }) => log(`[发送 -> ${chatKey}] ${String(text).slice(0, 60)}`)
   });
-  const orchestrator = new Orchestrator({ store, memory, stickers, sender, sessions, onebot, emit });
+  const mcp = new McpManager();
+  const orchestrator = new Orchestrator({ store, memory, stickers, sender, sessions, onebot, emit, mcp });
 
   // 远程价格表：启动即初始化（内部幂等；URL 为空则完全不动）
   initPriceFeed(cfg.api?.priceRemoteUrl || '');
@@ -633,6 +635,8 @@ export function createApp({ log = console.log } = {}) {
     // 顶层 api：walk 已生成 hasApiKey，这里补一个简写的 hasKey 供旧代码读取
     if (out.api) out.api.hasKey = out.api.hasApiKey ?? Boolean(String(cfg?.api?.apiKey ?? '').trim());
 
+    // MCP 的任意环境变量和请求头都可能是凭据，不能只按字段名猜测。
+    out.mcp = { servers: (cfg?.mcp?.servers || []).map(publicMcpServer) };
     return out;
   }
 
@@ -698,6 +702,36 @@ export function createApp({ log = console.log } = {}) {
       if (!authorize(req)) return json(res, 401, { error: '未授权' });
       const method = req.method;
       const cfgNow = getConfig();
+
+      if (pathname === '/api/mcp/servers' || pathname.startsWith('/api/mcp/servers/')) {
+        if (!keyEndpointAllowed(req)) return json(res, 403, { error: '请从本机控制台管理 MCP 服务' });
+        try {
+          if (pathname === '/api/mcp/servers' && method === 'GET') return json(res, 200, { servers: mcp.list() });
+          if (pathname === '/api/mcp/servers' && method === 'POST') {
+            const service = await mcp.upsert(await readBody(req));
+            return json(res, 200, { server: service });
+          }
+          const match = /^\/api\/mcp\/servers\/([a-zA-Z0-9_-]{1,24})(?:\/(discover|call))?$/.exec(pathname);
+          if (match && !match[2] && method === 'DELETE') {
+            await mcp.remove(match[1]);
+            return json(res, 200, { ok: true });
+          }
+          if (match?.[2] === 'discover' && method === 'POST') {
+            await mcp.ensure(match[1], { refresh: true });
+            return json(res, 200, { server: mcp.list().find((s) => s.id === match[1]) });
+          }
+          if (match?.[2] === 'call' && method === 'POST') {
+            const body = await readBody(req);
+            const [kind, id] = String(body.chatKey || '').split(':');
+            if (!/^(group|private):\d+$/.test(body.chatKey || '') || !allowed(kind, id, getConfig())) return json(res, 403, { error: '请选择机器人白名单内的聊天进行试调用' });
+            const result = await mcp.call(match[1], String(body.name || ''), body.arguments ?? {}, body.chatKey);
+            return json(res, 200, result);
+          }
+          return json(res, 404, { error: '未知 MCP 接口' });
+        } catch (error) {
+          return json(res, 400, { error: String(error?.message || error).slice(0, 1000) });
+        }
+      }
 
       if (pathname === '/api/status' && method === 'GET') {
         const dayKey = todayKey();
@@ -1172,12 +1206,13 @@ export function createApp({ log = console.log } = {}) {
 
       if (pathname === '/api/config' && method === 'POST') {
         const patch = await readBody(req);
+        if ('mcp' in patch) return json(res, 400, { error: 'MCP 配置请通过工具页面保存' });
         const next = updateConfig(patch);
         store.setMaxPerChat(next.store?.maxMessagesPerChat ?? 0);
         if (next.proactive?.enabled) orchestrator.startProactiveLoop(); else orchestrator.stopProactiveLoop();
         initPriceFeed(next.api?.priceRemoteUrl || '');   // 远程价格表 URL 可能改了（内部幂等）
         emit('status', { configUpdated: true });
-        return json(res, 200, { ok: true, config: next });
+        return json(res, 200, { ok: true, config: { ...next, mcp: { servers: (next.mcp?.servers || []).map(publicMcpServer) } } });
       }
 
       if (pathname === '/api/version' && method === 'GET') {
@@ -1612,6 +1647,7 @@ export function createApp({ log = console.log } = {}) {
 
   async function stop() {
     await orchestrator.abortAll();
+    await mcp.close();
     onebot.close();
     server.close();
     // 内置启动的 SnowLuma：QQ Agent 退出时一并关掉，避免留一个无窗口的后台进程。
@@ -1620,7 +1656,7 @@ export function createApp({ log = console.log } = {}) {
     try { snowlumaProc?.kill(); } catch { /* ignore */ }
   }
 
-  return { server, onebot, store, memory, stickers, sender, sessions, orchestrator, start, stop, emit, getConfig, updateConfig, launchSnowluma, stopSnowluma, snowlumaStatus };
+  return { server, onebot, store, memory, stickers, sender, sessions, orchestrator, mcp, start, stop, emit, getConfig, updateConfig, launchSnowluma, stopSnowluma, snowlumaStatus };
 }
 
 /**

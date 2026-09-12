@@ -46,6 +46,8 @@ export const DEFAULT_CONFIG = {
   dshProviderKeys: {},   // providerId -> 真实 API Key（providers[] 里不再存明文 Key）
   providersSourceYaml: '',
   providersImported: true,
+  // 外部工具：仅管理员添加服务；新服务默认不启用任何工具。
+  mcp: { servers: [] },
   // 联网搜索（默认 Bing 网页解析，无需 key；可选 DeepSeek/智谱/博查/百度/秘塔）
   webSearch: {
     enabled: true,

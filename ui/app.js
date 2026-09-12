@@ -2650,6 +2650,7 @@ function renderSettingsSidebar() {
   const menu = [
     ['api', '模型 API'],
     ['search', '搜索服务'],
+    ['mcp', '工具（MCP）'],
     ['memory', '记忆'],
     ['persona', '人设'],
     ['allow', '聊天白名单'],
@@ -2695,6 +2696,7 @@ function renderSettings() {
 
 function renderSettingsSection(c) {
   const sec = state.settingsSection || 'api';
+  if (sec === 'mcp') return renderMcpSection();
   const sections = {
     api: () => renderApiSection(c),
     search: () => renderSearchSection(c),
@@ -2904,6 +2906,159 @@ function renderSearchSection(c) {
       <span id="add-search-provider-hint" class="muted" style="font-size:12px"></span>
     </div>
   `;
+}
+
+function renderMcpSection() {
+  return `<h3>工具（MCP）</h3>
+    <p class="hint">连接本机或远程 MCP 服务，选择允许机器人使用的工具。现有 QQ、搜索和记忆工具继续可用。</p>
+    <div class="mcp-toolbar"><label for="mcp-picker">服务</label><select id="mcp-picker" aria-label="选择 MCP 服务"><option value="">新服务</option></select>
+      <button class="btn" id="mcp-new">＋ 添加服务</button><button class="btn" id="mcp-reload">刷新状态</button></div>
+    <div id="mcp-notice" class="hint" role="status" aria-live="polite">加载中…</div><div id="mcp-editor"></div>`;
+}
+
+async function bindMcpPage() {
+  const editor = $('#mcp-editor');
+  const notice = $('#mcp-notice');
+  const picker = $('#mcp-picker');
+  let servers = [];
+  let current = null;
+  let busy = false;
+  const show = (message) => { notice.textContent = message; };
+  const parseJson = (selector, fallback, label) => {
+    const text = $(selector).value.trim();
+    if (!text) return fallback;
+    try { return JSON.parse(text); } catch { throw new Error(`${label} 不是有效 JSON`); }
+  };
+  const readForm = () => {
+    const payload = {
+      ...(current?.id ? { id: current.id } : {}),
+      name: $('#mcp-name').value.trim(), transport: $('#mcp-transport').value,
+      command: $('#mcp-command').value.trim(), args: parseJson('#mcp-args', [], '启动参数'),
+      cwd: $('#mcp-cwd').value.trim(), url: $('#mcp-url').value.trim(),
+      enabled: $('#mcp-enabled').checked,
+      timeoutMs: Number($('#mcp-timeout').value), maxResultChars: Number($('#mcp-maxchars').value),
+      scope: { mode: $('#mcp-scope').value, chatKeys: $('#mcp-chats').value.split(/[\s,，]+/).filter(Boolean) },
+      enabledTools: [...editor.querySelectorAll('[data-mcp-tool]:checked')].map((el) => el.dataset.mcpTool)
+    };
+    // 空输入 = 保留已保存凭据；明确填 {} 才清空，绝不回显真实值。
+    if ($('#mcp-env').value.trim()) payload.env = parseJson('#mcp-env', {}, '环境变量');
+    if ($('#mcp-headers').value.trim()) payload.headers = parseJson('#mcp-headers', {}, 'HTTP 请求头');
+    return payload;
+  };
+  function fillPicker(id = '') {
+    picker.innerHTML = '<option value="">新服务</option>' + servers.map((s) => `<option value="${esc(s.id)}">${esc(s.name)}${s.enabled ? '' : '（未启用）'}</option>`).join('');
+    picker.value = id;
+    state.mcpSelectedId = id;
+  }
+  function renderEditor(s = null) {
+    current = s;
+    const tools = [...(s?.tools || [])];
+    for (const name of s?.enabledTools || []) {
+      if (!tools.some((t) => t.name === name)) tools.push({ name, description: '已保存的选择；连接后可检查此工具是否仍然可用。' });
+    }
+    const knownChats = [...(state.config?.allow?.groups || []).map((id) => `group:${id}`), ...(state.config?.allow?.private || []).map((id) => `private:${id}`)];
+    const statusText = { connected: '已连接', connecting: '连接中', disconnected: '尚未连接', error: '连接失败' }[s?.status] || '新服务';
+    editor.innerHTML = `<div class="mcp-status"><strong>${esc(statusText)}</strong><span class="hint">${esc(s?.error || '')}</span></div>
+      <div class="field-row"><div class="field"><label for="mcp-name">服务名称</label><input type="text" id="mcp-name" value="${esc(s?.name || '')}" placeholder="例如：我的知识库" maxlength="80"></div>
+        <div class="field"><label for="mcp-transport">连接方式</label><select id="mcp-transport"><option value="stdio" ${s?.transport !== 'http' ? 'selected' : ''}>本机程序（stdio）</option><option value="http" ${s?.transport === 'http' ? 'selected' : ''}>服务 URL（Streamable HTTP）</option></select></div></div>
+      <div id="mcp-stdio-fields">
+        <div class="field"><label for="mcp-command">启动程序</label><input type="text" id="mcp-command" value="${esc(s?.command || '')}" placeholder="node、npx、uvx 或程序绝对路径"><div class="hint">这里只填程序名或路径，启动参数填写在下方。本机程序使用当前系统账户权限运行。</div></div>
+        <div class="field"><label for="mcp-args">启动参数（JSON 数组）</label><textarea id="mcp-args" class="mcp-json" spellcheck="false" placeholder='["D:/services/server.mjs"]'>${esc(JSON.stringify(s?.args || [], null, 2))}</textarea></div>
+        <div class="field"><label for="mcp-cwd">工作目录（可选，绝对路径）</label><input type="text" id="mcp-cwd" value="${esc(s?.cwd || '')}"></div>
+        <div class="field"><label for="mcp-env">环境变量（JSON 对象）</label><textarea id="mcp-env" class="mcp-json" spellcheck="false" autocomplete="off" placeholder='{"MY_API_KEY":"你的密钥"}'></textarea><div class="hint">${s?.envKeys?.length ? `已保存：${esc(s.envKeys.join('、'))}。` : ''}留空保留，输入新对象整体替换，填 {} 清空。</div></div>
+      </div>
+      <div id="mcp-http-fields">
+        <div class="field"><label for="mcp-url">MCP 服务 URL</label><input type="text" id="mcp-url" value="${esc(s?.url || '')}" placeholder="http://127.0.0.1:8000/mcp"><div class="hint">填写服务提供的 Streamable HTTP 地址。本版不支持旧 SSE 地址或 OAuth 登录。</div></div>
+        <div class="field"><label for="mcp-headers">HTTP 请求头（JSON 对象，可选）</label><textarea id="mcp-headers" class="mcp-json" spellcheck="false" autocomplete="off" placeholder='{"Authorization":"Bearer 你的令牌"}'></textarea><div class="hint">${s?.headerKeys?.length ? `已保存：${esc(s.headerKeys.join('、'))}。` : ''}留空保留，输入新对象整体替换，填 {} 清空。密钥请放在这里。</div></div>
+      </div>
+      <div class="field-row"><div class="field"><label for="mcp-timeout">请求超时（毫秒）</label><input type="number" id="mcp-timeout" min="1000" max="180000" value="${s?.timeoutMs || 30000}"></div>
+        <div class="field"><label for="mcp-maxchars">单次返回字符上限</label><input type="number" id="mcp-maxchars" min="512" max="50000" value="${s?.maxResultChars || 8000}"></div></div>
+      <div class="checkbox-row"><input type="checkbox" id="mcp-enabled" ${s?.enabled ? 'checked' : ''}><label for="mcp-enabled">允许机器人使用此服务中勾选的工具</label></div>
+      <div class="field"><label for="mcp-scope">适用聊天</label><select id="mcp-scope"><option value="all">机器人白名单内的所有聊天</option><option value="selected" ${s?.scope?.mode === 'selected' ? 'selected' : ''}>仅指定聊天</option></select></div>
+      <div class="field" id="mcp-chats-field"><label for="mcp-chats">指定群聊／私聊（每行一个）</label><textarea id="mcp-chats" class="mcp-json" placeholder="group:123456&#10;private:654321">${esc((s?.scope?.chatKeys || []).join('\n'))}</textarea><div class="hint">指定列表留空时不授权任何聊天；仍受机器人聊天白名单限制。</div></div>
+      <div class="mcp-toolbar"><button class="btn btn-primary" id="mcp-discover">保存并发现工具</button><button class="btn" id="mcp-save">保存设置与工具选择</button>${s ? '<button class="btn" id="mcp-delete">删除服务</button>' : ''}</div>
+      <div class="settings-divider"></div><h3>可用工具 <span class="muted">${tools.length}</span></h3>
+      <p class="hint">勾选并保存后，模型才能调用。试调用会实际执行工具；新发现的工具默认不勾选。文本和结构化结果会交给模型，图片／音频暂不转发。</p>
+      <div class="mcp-tools">${tools.map((t, i) => `<div class="mcp-tool"><label class="checkbox-row"><input type="checkbox" data-mcp-tool="${esc(t.name)}" ${(s?.enabledTools || []).includes(t.name) ? 'checked' : ''} ${t.unavailableReason ? 'disabled' : ''}><strong>${esc(t.name)}</strong></label><p>${esc(t.description || '暂无说明')}</p>${t.unavailableReason ? `<p class="mcp-error">${esc(t.unavailableReason)}</p>` : ''}<details><summary>参数格式</summary><pre>${esc(JSON.stringify(t.inputSchema || {}, null, 2))}</pre></details><button class="btn btn-small" data-mcp-try="${i}" ${t.unavailableReason ? 'disabled' : ''}>填写参数试调用</button></div>`).join('') || '<p class="hint">还没有工具。填写连接信息后，点击「保存并发现工具」。</p>'}</div>
+      <div id="mcp-test" hidden><h3 id="mcp-test-title">试调用</h3><div class="field"><label for="mcp-test-chat">以哪个聊天的权限调用</label><input type="text" id="mcp-test-chat" list="mcp-known-chats" placeholder="group:123456" value="${esc(knownChats[0] || '')}"><datalist id="mcp-known-chats">${knownChats.map((k) => `<option value="${esc(k)}"></option>`).join('')}</datalist></div><div class="field"><label for="mcp-test-args">调用参数（JSON 对象）</label><textarea id="mcp-test-args" class="mcp-json" spellcheck="false">{}</textarea></div><button class="btn" id="mcp-test-run">执行试调用</button><pre id="mcp-test-result" class="mcp-result" aria-live="polite"></pre></div>`;
+    const updateFields = () => {
+      $('#mcp-stdio-fields').hidden = $('#mcp-transport').value !== 'stdio';
+      $('#mcp-http-fields').hidden = $('#mcp-transport').value !== 'http';
+      $('#mcp-chats-field').hidden = $('#mcp-scope').value !== 'selected';
+    };
+    updateFields();
+    $('#mcp-transport').addEventListener('change', updateFields);
+    $('#mcp-scope').addEventListener('change', updateFields);
+    $('#mcp-discover').addEventListener('click', () => run(async () => {
+      const saved = await save();
+      show('配置已保存，正在连接并发现工具…');
+      try {
+        const result = await api(`/api/mcp/servers/${saved.id}/discover`, { method: 'POST', body: '{}' });
+        replaceServer(result.server);
+        show(`已发现 ${result.server.tools.length} 个工具。勾选需要的工具，开启服务并保存后即可用于聊天。`);
+      } catch (error) {
+        await reload(saved.id);
+        throw error;
+      }
+    }));
+    $('#mcp-save').addEventListener('click', () => run(async () => { await save(); show('已保存。聊天时将使用当前启用的工具和适用范围。'); }));
+    $('#mcp-delete')?.addEventListener('click', () => run(async () => {
+      await api(`/api/mcp/servers/${s.id}`, { method: 'DELETE' });
+      await reload('');
+      show('服务已删除并断开连接。');
+    }));
+    let testTool = '';
+    editor.querySelectorAll('[data-mcp-try]').forEach((button) => button.addEventListener('click', () => {
+      testTool = tools[Number(button.dataset.mcpTry)].name;
+      $('#mcp-test').hidden = false;
+      $('#mcp-test-title').textContent = `试调用：${testTool}`;
+      $('#mcp-test-args').value = '{}';
+      $('#mcp-test-result').textContent = '请先保存工具选择；这里会使用已保存的权限配置。';
+      $('#mcp-test').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    }));
+    $('#mcp-test-run').addEventListener('click', () => run(async () => {
+      if (!current?.id || !testTool) throw new Error('请先保存服务并选择工具');
+      $('#mcp-test-result').textContent = '调用中…';
+      const result = await api(`/api/mcp/servers/${current.id}/call`, {
+        method: 'POST', body: JSON.stringify({ name: testTool, arguments: parseJson('#mcp-test-args', {}, '调用参数'), chatKey: $('#mcp-test-chat').value.trim() })
+      });
+      $('#mcp-test-result').textContent = `${result.isError ? '调用失败\n' : ''}${result.content}`;
+      show(result.isError ? '试调用失败，详情见下方。' : '试调用完成。');
+    }));
+  }
+  function replaceServer(s) {
+    servers = [...servers.filter((x) => x.id !== s.id), s];
+    fillPicker(s.id);
+    renderEditor(s);
+  }
+  async function save() {
+    const tools = current?.tools || [];
+    const payload = readForm();
+    const result = await api('/api/mcp/servers', { method: 'POST', body: JSON.stringify(payload) });
+    // 修改配置会关闭旧连接；保留上次发现的列表供继续选择，实际调用会重新发现。
+    replaceServer({ ...result.server, tools: result.server.tools.length ? result.server.tools : tools });
+    return result.server;
+  }
+  async function reload(id = state.mcpSelectedId || '') {
+    const result = await api('/api/mcp/servers');
+    if ($('#mcp-editor') !== editor) return;
+    servers = result.servers;
+    const s = servers.find((s) => s.id === id) || null;
+    fillPicker(s?.id || '');
+    renderEditor(s);
+  }
+  async function run(fn) {
+    if (busy) return;
+    busy = true;
+    editor.setAttribute('aria-busy', 'true');
+    show('处理中…');
+    try { await fn(); } catch (error) { show(`操作失败：${error.message}`); }
+    finally { busy = false; editor.setAttribute('aria-busy', 'false'); }
+  }
+  picker.addEventListener('change', () => { if (!busy) { renderEditor(servers.find((s) => s.id === picker.value) || null); state.mcpSelectedId = picker.value; show(''); } });
+  $('#mcp-new').addEventListener('click', () => { if (!busy) { fillPicker(); renderEditor(); show('填写服务信息后保存并发现工具。'); } });
+  $('#mcp-reload').addEventListener('click', () => run(async () => { await reload(); show('状态已刷新。'); }));
+  try { await reload(); show('配置保存在本机。添加服务不会自动启用其中的工具。'); } catch (error) { show(`加载失败：${error.message}`); }
 }
 
 function renderMemorySettingsSection(c) {
@@ -3240,6 +3395,7 @@ function renderOnebotSection(c) {
 }
 
 function bindSettingsEvents(c) {
+  if (state.settingsSection === 'mcp') { bindMcpPage(); return; }
   // 保存当前区块设置（通用保存按钮）。只有当前区块的字段才会被读取，不会 null 报错。
   const saveCfgBtn = $('#save-cfg-btn');
   if (saveCfgBtn) saveCfgBtn.addEventListener('click', async () => {

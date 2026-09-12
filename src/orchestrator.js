@@ -18,7 +18,7 @@ import { modelImageVerdict } from './vision-scan.js';
 import { currentProviders } from './providers.js';
 
 export class Orchestrator {
-  constructor({ store, memory, stickers, sender, sessions, onebot, emit = null }) {
+  constructor({ store, memory, stickers, sender, sessions, onebot, emit = null, mcp = null }) {
     this.store = store;
     this.memory = memory;
     this.stickers = stickers;
@@ -27,6 +27,7 @@ export class Orchestrator {
     this.onebot = onebot;
     this.emit = typeof emit === 'function' ? emit : ((b) => b.emit.bind(b))(createEventBus());
     this.toolDefs = buildToolDefs();
+    this.mcp = mcp;
 
     this.chatNameCache = new Map();    // groupId -> name
     this.wakeTimers = new Map();       // chatKey -> timer
@@ -332,6 +333,7 @@ export class Orchestrator {
           const canRetry = attempt < MAX_SESSION_ATTEMPTS
             && isRetryableError(error)
             && sentCount === 0
+            && !session.externalToolAttempted
             && !this.aborted;
           if (!canRetry) break;
 
@@ -470,6 +472,14 @@ export class Orchestrator {
       if (!searchEnabled && (d.name === 'web_search' || d.name === 'web_fetch')) return false;
       return true;
     });
+    if (this.mcp) {
+      const external = await this.mcp.toolDefsForChat(chatKey);
+      toolDefs.push(...external.defs);
+      session.mcpWarnings = external.warnings;
+      if (external.warnings.length) {
+        session.feedbacks.push(...external.warnings.map((message) => ({ level: 'warning', message: `MCP：${message}`, at: Date.now() })));
+      }
+    }
     const openAiTools = toOpenAiTools(toolDefs);
 
     const ctx = {
@@ -481,6 +491,7 @@ export class Orchestrator {
       store: this.store,
       memory: this.memory,
       stickers: this.stickers,
+      mcp: this.mcp,
       sender: this.sender,
       session,
       emit: (type, payload) => this.emit(type, payload)

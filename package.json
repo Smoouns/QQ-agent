@@ -49,16 +49,20 @@
   "scripts": {
     "start": "electron .",
     "server": "node src/server.js",
-    "test": "node test/selftest.mjs && node test/render-test.mjs && node test/scroll-test.mjs && node test/usage-e2e.mjs",
+    "test": "node test/selftest.mjs && node test/render-test.mjs && node test/scroll-test.mjs && node test/usage-e2e.mjs && node test/mcp-test.mjs",
+    "test:mcp": "node test/mcp-test.mjs",
     "test:prompt": "node test/test-prompt.mjs",
     "test:render": "node test/render-test.mjs",
     "test:scroll": "node test/scroll-test.mjs",
     "test:usage": "node test/usage-e2e.mjs"
   },
   "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "ajv": "^8.20.0",
     "js-yaml": "^5.4.1",
     "undici": "^6.28.0",
-    "ws": "^8.18.0"
+    "ws": "^8.18.0",
+    "zod": "^4.6.2"
   },
   "devDependencies": {
     "electron": "^33.2.0",

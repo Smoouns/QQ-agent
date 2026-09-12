@@ -1,6 +1,7 @@
 // 实际执行 ui/app.js 的所有设置分区渲染函数，捕获运行时错误。
 // 目的：像"B 未定义"这类错误，node --check（语法检查）根本查不出来，
 // 只有真正跑一遍渲染才会暴露。
+import './isolated-env.mjs';
 import fs from 'node:fs';
 import vm from 'node:vm';
 import path from 'node:path';
@@ -107,7 +108,7 @@ try {
 
   // 取出渲染函数并执行
   const sections = [
-    'renderSettingsSection', 'renderApiSection', 'renderSearchSection',
+    'renderSettingsSection', 'renderApiSection', 'renderSearchSection', 'renderMcpSection',
     'renderMemorySettingsSection', 'renderPersonaSection', 'renderAllowSection',
     'renderChatSection', 'renderDesktopSection', 'renderOnebotSection',
     'renderPersonaPicker', 'renderHealthCard'
@@ -408,7 +409,7 @@ try {
           const { createApp: createApp2 } = await import('../src/app.js');
           const http = await import('node:http');
           const realApp = createApp2({ log: () => {} });
-          const realPort = await realApp.start(40991);
+          const realPort = await new Promise((resolve) => realApp.server.listen(0, '127.0.0.1', () => resolve(realApp.server.address().port)));
           const hit = (p) => new Promise((r) => {
             http.request({ host: '127.0.0.1', port: realPort, path: p, method: 'GET',
               headers: { 'x-console-token': 'qq-agent-console' } },
