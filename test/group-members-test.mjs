@@ -4,6 +4,8 @@ import { DEFAULT_CONFIG, setRuntimeConfig } from '../src/config.js';
 import { buildToolDefs, executeTool } from '../src/tools.js';
 
 const cfg = structuredClone(DEFAULT_CONFIG);
+// These existing integration scenarios explicitly exercise the legacy response gate.
+cfg.responseRules.groupMode = 'legacy';
 setRuntimeConfig(cfg);
 const defs = buildToolDefs();
 const calls = [];

@@ -615,6 +615,25 @@ try {
     } finally { sandbox.fetch = oldFetch; }
   }
 
+  console.log('\n=== 群聊响应规则设置 ===');
+  {
+    const settings = structuredClone(cfg);
+    settings.responseRules = { ...DEFAULT_CONFIG.responseRules, chats: {
+      'group:123': { mode: 'rules', maxPerMinute: 4, silenceEnabled: false },
+      'private:456': { mode: 'direct' }
+    } };
+    const html = ctx.renderChatSection(settings);
+    const group = ctx.renderResponseOverride('group:123', settings.responseRules.chats['group:123']);
+    const privateChat = ctx.renderResponseOverride('private:456', settings.responseRules.chats['private:456']);
+    for (const [name, ok] of [
+      ['默认规则与高级参数可渲染', html.includes('群聊自动参与') && html.includes('id="response-maxPerMinute"') && html.includes('value="2"')],
+      ['一分钟热聊和累计保底参数可全局及逐群调整', html.includes('id="response-windowMs" type="number" min="1000" max="300000" value="60000"') && html.includes('id="response-fallbackMessages"') && group.includes('data-rule="fallbackMessages"') && !privateChat.includes('data-rule="fallbackMessages"')],
+      ['群聊可覆盖规则、额度和关闭冷场', group.includes('data-rule="maxPerMinute"') && group.includes('value="4"') && group.includes('value="false" selected')],
+      ['私聊有独立响应方式但不能启用热聊冷场', privateChat.includes('value="direct" selected') && !privateChat.includes('value="rules"') && !privateChat.includes('data-rule="silenceMs"')],
+      ['移除旧随机冷场入口，保留兼容档位', !html.includes('id="cfg-proactive"') && html.includes('兼容模式：响应档位')]
+    ]) { ok ? pass++ : fail++; console.log('  ' + (ok ? 'OK   ' : 'FAIL ') + name); }
+  }
+
 } catch (e) {
   fail++;
   console.log('\n加载 app.js 失败: ' + (e && e.message));

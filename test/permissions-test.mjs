@@ -13,6 +13,8 @@ import { buildSystemPrompt } from '../src/prompt.js';
 
 let count = 0, mid = 1000;
 const cfg = structuredClone(DEFAULT_CONFIG);
+// These existing integration scenarios explicitly exercise the legacy response gate.
+cfg.responseRules.groupMode = 'legacy';
 cfg.allowAllWhenEmpty = true;
 cfg.providersImported = true;
 cfg.memory.consolidateEnabled = false;

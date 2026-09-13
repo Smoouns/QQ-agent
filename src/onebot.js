@@ -300,7 +300,7 @@ export function extractMediaFromSegments(segments) {
  *   - 每个节点一行「昵称: 内容」，内容复用 segmentsToText（@/图片/表情等占位一致）
  *   - 嵌套转发不再展开（深度 1 封顶，套娃截断）
  *   - 封顶：maxNodes 条 / maxChars 字符，超出注明"还有 N 条未展开"
- *   - 节点里的图片段同时提取到 media（url 新鲜，可用于取图/金句）
+ *   - 节点里的图片段同时提取到 media（url 新鲜，可用于按需取图）
  *
  * @param {Array} nodes get_forward_msg 返回的 messages 数组
  * @returns {{ text: string, media: Array } | null} 无可用节点返回 null

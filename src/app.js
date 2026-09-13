@@ -20,8 +20,7 @@ import { McpManager, publicMcpServer } from './mcp.js';
 import { listModels, chatCompletion, resolveApiKey, estimateCost, cacheHitRate } from './llm.js';
 import { resolveOfficialPrice, listOfficialPrices, isPeakHour, priceAt, resolveModelPrice, modelLabel, splitModelLabel, UNKNOWN_VENDOR } from './model-prices.js';
 import { initPriceFeed, refreshPriceFeed, priceFeedStatus } from './price-feed.js';
-import { startTelemetryLoop } from './telemetry.js';
-import { importFromDsh, currentProviders, setProviderKey, testAllProviders, testOneProvider, testModelChat, fetchModelsFrom, upsertProvider, addModelsToProvider, removeModelFromProvider } from './providers.js';
+import { currentProviders, setProviderKey, testAllProviders, testOneProvider, testModelChat, fetchModelsFrom, upsertProvider, addModelsToProvider, removeModelFromProvider } from './providers.js';
 import { scanModelsVision, visionResults, modelImageVerdict } from './vision-scan.js';
 import { builtinVisionResults } from './model-vision-docs.js';
 import { createEventBus, todayKey } from './util.js';
@@ -50,27 +49,11 @@ function allowed(kind, id, cfg) {
   return cfg.allowAllWhenEmpty === true;
 }
 
-// ── 版本更新检查 ─────────────────────────────────────────────────────
-// 线上版本信息只有一份：kondius.cn/qq-agent/version.json（发版时手动改）。
-// 由后端代取而不是前端直连：绕过 CORS，且失败信息能统一回给 UI。
-const UPDATE_INFO_URL = 'https://kondius.cn/qq-agent/version.json';
-
 function localVersion() {
   try {
     const pkg = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8'));
     return String(pkg.version || '0.0.0');
   } catch { return '0.0.0'; }
-}
-
-/** x.y.z 三段数字比较；返回 1 / 0 / -1。非数字段按 0 处理，够用。 */
-function compareSemver(a, b) {
-  const pa = String(a).split('.').map((x) => parseInt(x, 10) || 0);
-  const pb = String(b).split('.').map((x) => parseInt(x, 10) || 0);
-  for (let i = 0; i < 3; i++) {
-    if ((pa[i] || 0) > (pb[i] || 0)) return 1;
-    if ((pa[i] || 0) < (pb[i] || 0)) return -1;
-  }
-  return 0;
 }
 
 export function createApp({ log = console.log } = {}) {
@@ -460,7 +443,7 @@ export function createApp({ log = console.log } = {}) {
     // 合并转发：占位符 → 展开真实内容（模型要读懂、看懂转发的聊天记录）
     // 实测结论（2026-09-05，SnowLuma/NapCat）：get_forward_msg 只认 message_id；
     // res_id（转发卡片里那个 id）会过期，报 "payload is empty"。
-    // 媒体里的 url 此时是新鲜的，一并收进 media（取图/金句都能用）。
+    // 媒体里的 url 此时是新鲜的，一并收进 media（按需取图使用）。
     // 展开失败时占位符留在存档里，模型可用 read_forward 工具稍后重试。
     if (segments && (text.includes('[合并转发') || text.includes('[转发消息')) && event.message_id != null) {
       try {
@@ -1269,7 +1252,7 @@ export function createApp({ log = console.log } = {}) {
         if ('mcp' in patch) return json(res, 400, { error: 'MCP 配置请通过工具页面保存' });
         const next = updateConfig(patch);
         store.setMaxPerChat(next.store?.maxMessagesPerChat ?? 0);
-        if (next.proactive?.enabled) orchestrator.startProactiveLoop(); else orchestrator.stopProactiveLoop();
+        orchestrator.startProactiveLoop();
         if (!orchestrator.aborted) orchestrator.memoryPipeline.resume();
         initPriceFeed(next.api?.priceRemoteUrl || '');   // 远程价格表 URL 可能改了（内部幂等）
         emit('status', { configUpdated: true });
@@ -1279,25 +1262,6 @@ export function createApp({ log = console.log } = {}) {
       if (pathname === '/api/version' && method === 'GET') {
         // 纯本地读取，无网络依赖：设置页"当前版本"展示用
         return json(res, 200, { version: localVersion() });
-      }
-
-      if (pathname === '/api/update-check' && method === 'GET') {
-        const current = localVersion();
-        try {
-          const r = await fetch(UPDATE_INFO_URL, { signal: AbortSignal.timeout(8000), cache: 'no-store' });
-          if (!r.ok) throw new Error(`HTTP ${r.status}`);
-          const info = await r.json();
-          const latest = String(info.version || '');
-          if (!latest) throw new Error('version.json 缺少 version 字段');
-          return json(res, 200, {
-            ok: true, current, latest,
-            hasUpdate: compareSemver(latest, current) > 0,
-            url: String(info.url || 'https://kondius.cn/qq-agent'),
-            notes: String(info.notes || '')
-          });
-        } catch (error) {
-          return json(res, 200, { ok: false, current, error: String(error?.message ?? error) });
-        }
       }
 
       if (pathname === '/api/models' && method === 'GET') {
@@ -1442,65 +1406,10 @@ export function createApp({ log = console.log } = {}) {
         const messages = store.recent(chatKey, { limit }).map((m) => ({
           id: m.id, mid: m.mid, ts: m.ts, senderId: m.senderId, senderName: m.senderName,
           text: m.text, self: m.self, read: m.read, reply: m.reply,
-          // media 必须带：金句上传要靠它把图片 URL 传给服务器转存
-          // （曾经漏了这个字段，前端收到的 media 永远是 undefined → 图片全丢）
+          // 保留消息媒体元数据，供本地存档使用。
           media: m.media || []
         }));
         return json(res, 200, { chatKey, messages });
-      }
-
-      // ── 金句上传取图：把存档消息里的图片转成 dataURL ──
-      // 背景：存档只存图片 URL，而 QQ 图床的 rkey 会过期（失效后全网 400 invalid url，
-      // 服务器转存必败、原图也救不回）。NapCat/SnowLuma 收到图时有本地缓存，
-      // 走 OneBot get_image 拿缓存文件读出来，彻底不依赖 URL 时效。
-      // POST { items: [{ file, url }] } → { results: [{ dataUrl } | null, ...] }
-      const mediaDataMatch = pathname === '/api/media-data';
-      if (mediaDataMatch && method === 'POST') {
-        try {
-          const body = await readBody(req);
-          const items = Array.isArray(body?.items) ? body.items.slice(0, 20) : [];
-          const mimeOf = (p) => /\.png$/i.test(p) ? 'image/png' : /\.gif$/i.test(p) ? 'image/gif' : /\.webp$/i.test(p) ? 'image/webp' : 'image/jpeg';
-          const fileToDataUrl = (fp) => {
-            const st = fs.statSync(fp);   // 不存在直接抛
-            if (st.size > 15 * 1024 * 1024) return null;
-            return `data:${mimeOf(fp)};base64,${fs.readFileSync(fp).toString('base64')}`;
-          };
-          const results = [];
-          for (const it of items) {
-            let dataUrl = null;
-            // 路径 1：OneBot get_image → NapCat 本地缓存文件
-            try {
-              const ret = await onebot.call('get_image', { file: String(it?.file || '') });
-              if (ret?.file && fs.existsSync(String(ret.file))) dataUrl = fileToDataUrl(String(ret.file));
-              // 有的实现返回的是可下载的 url
-              if (!dataUrl && ret?.url) {
-                const r = await fetch(String(ret.url), { signal: AbortSignal.timeout(10000) });
-                if (r.ok) {
-                  const buf = Buffer.from(await r.arrayBuffer());
-                  if (buf.length && buf.length <= 15 * 1024 * 1024) {
-                    dataUrl = `data:${r.headers.get('content-type') || 'image/jpeg'};base64,${buf.toString('base64')}`;
-                  }
-                }
-              }
-            } catch { /* 缓存没有就走下一条 */ }
-            // 路径 2：直接拉存档里的 URL（新消息 URL 还没过期时有效）
-            if (!dataUrl && it?.url) {
-              try {
-                const r = await fetch(String(it.url), { signal: AbortSignal.timeout(10000) });
-                if (r.ok && (r.headers.get('content-type') || '').startsWith('image/')) {
-                  const buf = Buffer.from(await r.arrayBuffer());
-                  if (buf.length && buf.length <= 15 * 1024 * 1024) {
-                    dataUrl = `data:${r.headers.get('content-type')};base64,${buf.toString('base64')}`;
-                  }
-                }
-              } catch { /* 过期就放弃，返回 null 让前端保留原 URL */ }
-            }
-            results.push(dataUrl ? { dataUrl } : null);
-          }
-          return json(res, 200, { ok: true, results });
-        } catch (error) {
-          return json(res, 200, { ok: false, error: String(error?.message ?? error), results: [] });
-        }
       }
 
       // 群成员列表（OneBot get_group_member_list），用于备注与记忆页成员展示
@@ -1660,9 +1569,6 @@ export function createApp({ log = console.log } = {}) {
     }
     if (port == null) throw lastError ?? new Error('无法监听端口');
 
-    // 匿名用量遥测：启动 90 秒后发第一次，之后每 6 小时一次；失败静默不影响使用
-    startTelemetryLoop(log);
-
     // 拉起 SnowLuma（如配置了自动启动）、连 OneBot。
     if (getConfig().snowluma?.autoLaunch) {
       try {
@@ -1687,7 +1593,7 @@ export function createApp({ log = console.log } = {}) {
       // accessToken/httpToken 已由 applyTokens 直接挂到实例（候选[0]）
     }
     await onebot.connect();
-    if (getConfig().proactive?.enabled) orchestrator.startProactiveLoop();
+    orchestrator.startProactiveLoop();
     orchestrator.memoryPipeline.resume();
     log(`控制台已就绪：http://127.0.0.1:${port}`);
     log(`OneBot（SnowLuma）: ws=${getConfig().snowluma?.wsUrl} http=${getConfig().snowluma?.httpUrl}`);

@@ -10,7 +10,7 @@
 // 不同会话之间并行，受 maxConcurrentRuns 全局限流。
 import { getConfig, storeConfigForChat } from './config.js';
 import { vendorOfConfig } from './model-prices.js';
-import { sleep, randInt, createEventBus, todayKey } from './util.js';
+import { sleep, createEventBus, todayKey } from './util.js';
 import { buildSystemPrompt, buildUserPrompt, resolveContextTier } from './prompt.js';
 import { chatCompletion, chatCompletionWithRetry, addUsage, isRetryableError } from './llm.js';
 import { buildToolDefs, toOpenAiTools, executeTool } from './tools.js';
@@ -19,6 +19,8 @@ import { currentProviders } from './providers.js';
 import { MemoryPipeline } from './memory-pipeline.js';
 import { selectWindow, messageAllowed, assertContextAllowed, recallMemories, primarySubjects } from './context.js';
 import { permissions, parseCommand } from './permissions.js';
+import { ResponseActivity, responseSettings } from './response-rules.js';
+import { sliderToTier } from './tier-slider.js';
 
 export class Orchestrator {
   constructor({ store, memory, stickers, sender, sessions, onebot, emit = null, mcp = null }) {
@@ -40,6 +42,9 @@ export class Orchestrator {
     this.runningChats = new Set();     // 正在运行的 chatKey
     this.activeRuns = new Map();       // chatKey -> sessionId
     this.gateRolls = new Map();
+    this.responseActivity = new ResponseActivity();
+    this.responseStartedAt = Date.now();
+    this.responseDecisions = new Map();
     this.runSeq = new Map();           // chatKey -> 第几次处理（跨重启清零即可）
     this.paused = false;
     this.pauseReason = null;
@@ -66,7 +71,11 @@ export class Orchestrator {
   /** 收到新消息（已通过白名单校验并写入 store）。 */
   onIncoming(chatKey) {
     this.memoryPipeline.schedule(chatKey);
-    if (this.paused || this.aborted) return;
+    if (this.paused || this.aborted) {
+      this.responseActivity.consume(chatKey, this.store.boundary(chatKey));
+      return;
+    }
+    if (responseSettings(getConfig(), chatKey).mode === 'rules') this.#observeActivity(chatKey);
     if (this.runningChats.has(chatKey)) return;   // 运行结束后 drain 会接管
     this.scheduleWake(chatKey);
   }
@@ -88,6 +97,13 @@ export class Orchestrator {
     const cfg = getConfig();
     const entries = (this.store.peekUnread(chatKey, Infinity) || []).filter((m) => messageAllowed(m, chatKey));
     if (entries.some(parseCommand)) return { tier: 0, reason: '直接命令', shouldRespond: true };
+    const botId = String(cfg.onebot?.selfId || this.onebot.selfId || '');
+    if (entries.some((m) => (botId && String(m.reply?.senderId || '') === botId)
+      || (m.reply?.mid != null && this.store.findByMid(chatKey, m.reply.mid)?.self))) {
+      return { tier: 1, reason: '回复机器人', shouldRespond: true };
+    }
+    const settings = responseSettings(cfg, chatKey);
+    if (settings.mode === 'rules') this.#observeActivity(chatKey, settings);
     if (!this.gateRolls.has(chatKey)) this.gateRolls.set(chatKey, Math.random() * 100);
     const r = resolveContextTier({
       triggerEntries: entries,
@@ -95,15 +111,64 @@ export class Orchestrator {
       selfNickname: cfg.persona?.selfNickname || this.onebot.selfNickname || '',
       botName: cfg.persona?.botName || '',
       selfId: cfg.onebot?.selfId || this.onebot.selfId || '',
-      cfg: storeConfigForChat(chatKey)   // 按会话取档位：统一开关关闭时各群可以有独立滑条
+      cfg: settings.mode === 'rules' || settings.mode === 'direct' ? { ...storeConfigForChat(chatKey), contextTier: 2 }
+        : settings.mode === 'all' ? { ...storeConfigForChat(chatKey), contextTier: 4 }
+        : settings.sliderPos != null ? { ...storeConfigForChat(chatKey), contextTier: sliderToTier(settings.sliderPos).tier, randomPercent: sliderToTier(settings.sliderPos).randomPercent }
+        : storeConfigForChat(chatKey)
     });
+    if (entries.length && r.shouldRespond) return r;
+    if (settings.mode === 'rules') {
+      const decision = this.responseActivity.evaluate(chatKey, settings);
+      this.#recordDecision(chatKey, decision);
+      if (decision.drop) this.responseActivity.consume(chatKey, this.store.boundary(chatKey), false, { preserveFallback: true });
+      return decision;
+    }
     // 没有未读就不算"需要响应"（防抖窗口刚建立时的空转）
     if (entries.length === 0) return { ...r, shouldRespond: false, reason: '无未读' };
     return r;
   }
 
+  #observeActivity(chatKey, settings = responseSettings(getConfig(), chatKey)) {
+    const state = this.responseActivity.state(chatKey);
+    const signature = JSON.stringify(settings);
+    if (state.signature !== null && state.signature !== signature) this.responseActivity.consume(chatKey, this.store.boundary(chatKey));
+    state.signature = signature;
+    const entries = (state.seen === this.store.boundary(chatKey) ? [] : this.store.after(chatKey, state.seen, { limit: Infinity, maxChars: Infinity }))
+      .map((m) => ({ ...m, command: !!parseCommand(m), allowed: Number(m.receivedAt || m.ts) >= this.responseStartedAt && messageAllowed(m, chatKey) }));
+    state.messages = state.messages.filter((m) => messageAllowed(m, chatKey));
+    state.unanswered = state.unanswered.filter((m) => messageAllowed(m, chatKey));
+    if (state.last && !messageAllowed(this.store.findByLocalId(chatKey, state.last.id) || {}, chatKey)) {
+      this.responseActivity.consume(chatKey, state.seen); state.last = null;
+    }
+    this.responseActivity.observe(chatKey, entries, settings);
+  }
+
+  #recordDecision(chatKey, decision) {
+    if (['等待新消息', '等待热聊或冷场', '热聊聚批等待', '保底聚批等待'].includes(decision.reason)) return;
+    if (this.responseDecisions.get(chatKey)?.reason === decision.reason) return;
+    const entry = { chatKey, reason: decision.reason, detail: decision.detail || '', at: Date.now() };
+    this.responseDecisions.set(chatKey, entry);
+    if (this.responseDecisions.size > 200) this.responseDecisions.delete(this.responseDecisions.keys().next().value);
+    this.emit('response-decision', entry);
+  }
+
+  #chatAllowed(chatKey) {
+    const cfg = getConfig(), [kind, id] = chatKey.split(':');
+    const key = kind === 'group' ? 'groups' : 'private';
+    return !(cfg.deny?.[key] || []).map(String).includes(id)
+      && ((cfg.allow?.[key] || []).length ? cfg.allow[key].map(String).includes(id) : cfg.allowAllWhenEmpty === true);
+  }
+
   scheduleWake(chatKey, delay = null) {
-    const ms = delay ?? Math.max(0, Number(getConfig().wakeDelayMs) || 2000);
+    let ms = delay ?? Math.max(0, Number(getConfig().wakeDelayMs) || 2000);
+    const settings = responseSettings(getConfig(), chatKey);
+    if (settings.mode === 'rules') {
+      this.#observeActivity(chatKey, settings);
+      const activity = this.responseActivity.state(chatKey);
+      for (const at of [activity.hotAt, activity.fallbackAt]) {
+        if (at !== null) ms = Math.min(ms, Math.max(0, at + settings.maxWaitMs - Date.now()));
+      }
+    }
     if (this.pendingWake.has(chatKey)) clearTimeout(this.wakeTimers.get(chatKey));
     this.pendingWake.add(chatKey);
 
@@ -211,7 +276,7 @@ export class Orchestrator {
 
   async wake(chatKey, { proactive = false, waitingSessionId = null } = {}) {
     if (this.aborted) { if (waitingSessionId) this.#finishWaiting(waitingSessionId, 'aborted'); return; }
-    if (this.paused && !proactive) { if (waitingSessionId) this.#finishWaiting(waitingSessionId, 'aborted'); return; }
+    if (this.paused) { if (waitingSessionId) this.#finishWaiting(waitingSessionId, 'aborted'); return; }
     if (this.runningChats.has(chatKey)) return;
 
     // 模型未设置：不产生报错会话，消息保留为未读；设置模型后（下一条消息或手动唤醒）自动补处理
@@ -222,6 +287,12 @@ export class Orchestrator {
 
     // 全局并发限制：满了就稍后重试
     if (this.runningChats.size >= Math.max(1, Number(getConfig().maxConcurrentRuns) || 2)) {
+      if (responseSettings(getConfig(), chatKey).mode === 'rules' && this.#predictTier(chatKey).automatic) {
+        this.responseActivity.consume(chatKey, this.store.boundary(chatKey), false, { preserveFallback: true });
+        this.#recordDecision(chatKey, { reason: '并发已满，跳过自动参与' });
+        if (waitingSessionId) this.#discardWaiting(waitingSessionId);
+        return;
+      }
       if (waitingSessionId) {
         const s = this.sessions.get(waitingSessionId);
         if (s && s.status === 'waiting') {
@@ -247,11 +318,19 @@ export class Orchestrator {
       return;
     }
     if (pendingEntries.length) proactive = false;
-    if (!proactive && !pendingEntries.length) {
+    const rulesMode = responseSettings(getConfig(), chatKey).mode === 'rules';
+    if (!proactive && !pendingEntries.length && !rulesMode) {
       if (waitingSessionId) this.#finishWaiting(waitingSessionId, 'aborted');
       return;
     }
-    const tierResult = proactive ? { tier: 0, reason: '主动机会', shouldRespond: true } : this.#predictTier(chatKey);
+    // Legacy callers cannot bypass the gate by setting proactive=true.
+    const tierResult = this.#predictTier(chatKey);
+    if (rulesMode && !this.#chatAllowed(chatKey)) {
+      this.responseActivity.consume(chatKey, boundary);
+      if (waitingSessionId) this.#discardWaiting(waitingSessionId);
+      return;
+    }
+    proactive = !!tierResult.automatic && pendingEntries.length === 0;
     this.gateRolls.delete(chatKey);
     if (!tierResult.shouldRespond) {
       this.store.acknowledge(chatKey, pendingEntries.map((m) => m.id));
@@ -259,7 +338,10 @@ export class Orchestrator {
       this.emit('chat-update', chatKey);
       return;
     }
-    const window = selectWindow(this.store, chatKey, proactive ? [] : pendingEntries, { boundary });
+    // An acknowledged message can still trigger a later silence/hot run, including with a zero history window.
+    const automaticSource = tierResult.automatic ? this.store.findByLocalId(chatKey, tierResult.sourceId) : null;
+    const runEntries = pendingEntries.length ? pendingEntries : automaticSource ? [automaticSource] : [];
+    const window = selectWindow(this.store, chatKey, runEntries, { boundary });
     const triggerEntries = window.trigger;
     const selectedMemories = recallMemories(this.memory, chatKey, {
       query: triggerEntries.map((m) => m.text).join('\n'),
@@ -275,7 +357,7 @@ export class Orchestrator {
     // 触发摘要
     const first = triggerEntries[0];
     const triggerSummary = proactive
-      ? '主动机会（冷场开话题）'
+      ? tierResult.reason
       : (first ? `${first.senderName || first.senderId}：${String(first.text || '').slice(0, 40)}` : '');
 
     // 把“等待中”会话原地转成运行中；没有等待会话（主动/手动唤醒）才新建
@@ -296,6 +378,7 @@ export class Orchestrator {
     this.activeRuns.set(chatKey, session.id);
     this.emit('chat-update', chatKey);
 
+    session.responseDecision = tierResult;
     // ── 会话级重试 ──
     // 单次 API 请求内部已经会重试（见 chatCompletionWithRetry），
     // 这里处理的是"整轮都救不回来"的情况：清干净上下文从头再来一次。
@@ -383,18 +466,21 @@ export class Orchestrator {
       emit: (type, payload) => this.emit(type, payload) };
     try {
       if (!messageAllowed(entry, chatKey)) throw new Error('此 QQ 已被屏蔽');
-      const result = await permissions.command(ctx, entry, async () => {
+      const result = await permissions.command(ctx, entry, async (targetTool) => {
         const cfg = getConfig();
         const vision = cfg.api.vision !== false && modelImageVerdict(cfg.api.provider, cfg.api.model) !== 'no-vision';
         const defs = this.toolDefs.filter((d) => (kind === 'group' || d.name !== 'get_group_members')
           && (vision || !['get_message_images', 'get_sticker_image'].includes(d.name))
           && (cfg.webSearch?.enabled !== false || !['web_search', 'web_fetch'].includes(d.name)));
-        if (this.mcp) defs.push(...(await this.mcp.toolDefsForChat(chatKey)).defs);
+        if (this.mcp && targetTool.startsWith('mcp:')) defs.push(...(await this.mcp.toolDefsForChat(chatKey)).defs);
         return defs;
       });
       session.finishReason = result.reply;
       const sent = await this.sender.sendTextBatch(chatKey, [result.reply], { replyToMessageId: entry.mid,
-        beforeSend: () => { if (!messageAllowed(entry, chatKey)) throw new Error('此 QQ 已被屏蔽'); } });
+        beforeSend: () => {
+          if (!messageAllowed(entry, chatKey)) throw new Error('此 QQ 已被屏蔽');
+          result.beforeReply?.();
+        } });
       session.sent.push(...sent.sent);
       this.sessions.finish(session.id, result.isError ? 'error' : 'done');
     } catch (error) {
@@ -556,7 +642,23 @@ export class Orchestrator {
       assertContextAllowed(session, this.memory, chatKey);
       markActivity('正在思考…');
       // 网络抖动/5xx/429 会自动重试（同一轮请求，messages 不变，幂等不重复发言）
-      const response = await chatCompletionWithRetry({ messages, tools: openAiTools, beforeRequest: () => assertContextAllowed(session, this.memory, chatKey) });
+      const response = await chatCompletionWithRetry({ messages, tools: openAiTools, beforeRequest: () => {
+        assertContextAllowed(session, this.memory, chatKey);
+        if (this.paused || this.aborted) throw new Error('机器人已暂停');
+        if (tierInfo?.automatic && !session.autoParticipationCharged) {
+          const settings = responseSettings(getConfig(), chatKey);
+          this.#observeActivity(chatKey, settings);
+          const live = this.responseActivity.evaluate(chatKey, settings);
+          const sameOpportunity = tierInfo.reason === '冷场接话' ? live.sourceId === tierInfo.sourceId
+            : ['热聊参与', '保底参与'].includes(live.reason) && this.responseActivity.state(chatKey).handled < tierInfo.sourceId;
+          if (!this.#chatAllowed(chatKey) || !live.shouldRespond || !sameOpportunity) throw new Error('自动参与条件已变化');
+          this.responseActivity.consume(chatKey, window.boundary, true);
+          session.autoParticipationCharged = true;
+        } else if (!tierInfo?.automatic && !session.activityConsumed) {
+          this.responseActivity.consume(chatKey, window.boundary);
+          session.activityConsumed = true;
+        }
+      } });
       session.model = response.model || session.model;
       addUsage(session.usage, response.usage);
       session.usage.calls += 1;
@@ -700,44 +802,37 @@ export class Orchestrator {
     return '';
   }
 
-  // ── 主动开话题 ─────────────────────────────────────────────────────────
-
+  // The old random proactive loop is replaced by deterministic group activity checks.
   startProactiveLoop() {
     this.stopProactiveLoop();
     const tick = async () => {
-      const cfg = getConfig();
-      const next = randInt(
-        Math.max(60000, Number(cfg.proactive?.checkIntervalMinMs) || 1800000),
-        Math.max(120000, Number(cfg.proactive?.checkIntervalMaxMs) || 5400000)
-      );
-      this.proactiveTimer = setTimeout(() => { tick().catch(() => {}); }, next);
-      if (this.aborted || this.paused || cfg.proactive?.enabled !== true) return;
-      if (this.runningChats.size >= Math.max(1, Number(cfg.maxConcurrentRuns) || 2)) return;
-      if (Math.random() > (Number(cfg.proactive?.probability) || 0.25)) return;
-      // 挑一个"安静且允许"的群
-      const candidates = this.#proactiveCandidates(cfg);
-      if (!candidates.length) return;
-      const chatKey = candidates[Math.floor(Math.random() * candidates.length)];
-      this.wake(chatKey, { proactive: true }).catch((error) => console.error('[orchestrator] proactive 出错:', error));
+      try { await this.tickResponseRules(); }
+      catch (error) { console.error('[response-rules]', error); }
+      if (!this.aborted) this.proactiveTimer = setTimeout(tick, 1000);
     };
-    this.proactiveTimer = setTimeout(() => { tick().catch(() => {}); }, 15000);
+    this.proactiveTimer = setTimeout(tick, 1000);
   }
 
-  #proactiveCandidates(cfg) {
-    const idleMs = Math.max(300000, Number(cfg.proactive?.idleThresholdMs) || 1800000);
-    const allowGroups = (cfg.allow?.groups ?? []).map(String);
-    const out = [];
-    for (const chatKey of this.store.listChats()) {
-      const [kind, id] = chatKey.split(':');
-      if (kind !== 'group') continue;
-      if (allowGroups.length > 0 ? !allowGroups.includes(id) : !cfg.allowAllWhenEmpty) continue;
-      const meta = this.store.getChatMeta(chatKey);
-      if (meta.unread > 0) continue;
-      if (Date.now() - meta.lastTs < idleMs) continue;
+  async tickResponseRules() {
+    if (this.aborted || this.paused) return;
+    for (const chatKey of this.responseActivity.states.keys()) {
+      const settings = responseSettings(getConfig(), chatKey);
+      if (settings.mode !== 'rules' || !chatKey.startsWith('group:')) continue;
+      this.#observeActivity(chatKey, settings);
+      if (!this.#chatAllowed(chatKey)) { this.responseActivity.consume(chatKey, this.store.boundary(chatKey)); continue; }
       if (this.runningChats.has(chatKey)) continue;
-      out.push(chatKey);
+      const decision = this.responseActivity.evaluate(chatKey, settings);
+      this.#recordDecision(chatKey, decision);
+      if (decision.drop) { this.responseActivity.consume(chatKey, this.store.boundary(chatKey), false, { preserveFallback: true }); continue; }
+      if (!decision.shouldRespond) continue;
+      if (this.runningChats.size >= Math.max(1, Number(getConfig().maxConcurrentRuns) || 2)) {
+        this.responseActivity.consume(chatKey, this.store.boundary(chatKey), false, { preserveFallback: true });
+        this.#recordDecision(chatKey, { reason: '并发已满，跳过自动参与' });
+        continue;
+      }
+      if (this.pendingWake.has(chatKey)) continue;
+      this.wake(chatKey).catch((error) => console.error('[response-rules] wake', error));
     }
-    return out;
   }
 
   // ── 增量记忆写入（与聊天上下文/已读状态独立）──
@@ -772,6 +867,7 @@ export class Orchestrator {
 
   setPaused(paused, reason = 'manual') {
     this.paused = !!paused;
+    if (this.paused) for (const key of this.responseActivity.states.keys()) this.responseActivity.consume(key, this.store.boundary(key));
     this.pauseReason = this.paused ? reason : null;
     this.emit('status', { paused: this.paused, pauseReason: this.pauseReason });
   }
@@ -795,6 +891,7 @@ export class Orchestrator {
       running: [...this.runningChats],
       activeSessions: [...this.activeRuns.entries()].map(([chatKey, sessionId]) => ({ chatKey, sessionId })),
       consolidating: [...this.consolidating],
+      responseDecisions: [...this.responseDecisions.values()],
       onebotConnected: this.onebot.connected,
       model: cfg.api.model,
       maxConcurrentRuns: cfg.maxConcurrentRuns

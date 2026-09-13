@@ -11,6 +11,7 @@ import { formatStickerList } from './stickers.js';
 import { validateImageUrl, safeFetchBinary } from './safe-fetch.js';
 import { webSearch, webFetch } from './web-search.js';
 import { expandForwardNodes } from './onebot.js';
+import { createComputerStatusTool } from './computer-status.js';
 
 async function downloadImageAsDataUrl(url, timeoutMs = 30000) {
   const safeUrl = await validateImageUrl(url);
@@ -112,6 +113,7 @@ function imageParts(text, dataUrls) {
  */
 export function buildToolDefs() {
   return [
+    createComputerStatusTool(),
     {
       name: 'send_message',
       description: '发送消息到当前聊天（本工具只能发到本次会话对应的群/私聊）。messages 传字符串=发一条；传字符串数组=分多条发送（推荐，更像真人）。只有需要明确"我回的是哪条"时才传 replyToMessageId 引用；需要点名某人才传 atUserId。不要在字符串内部用空格分句。',
@@ -348,7 +350,7 @@ export function buildToolDefs() {
           const nodes = Array.isArray(r?.messages) ? r.messages : [];
           const ex = await expandForwardNodes(nodes);
           if (!ex || !ex.text) return err('转发内容为空或已被 QQ 服务端丢弃（发送时间太久）');
-          // 写回存档：一次展开，永久升级这条记录（模型/存档页/金句墙都受益）
+          // 写回存档：一次展开，永久升级这条记录（模型/存档页都受益）
           ctx.store.updateByMid(ctx.chatKey, entry.mid, { text: ex.text, appendMedia: ex.media || [] });
           return ok({ messageId: entry.mid, text: ex.text, images: (ex.media || []).length });
         } catch (error) {

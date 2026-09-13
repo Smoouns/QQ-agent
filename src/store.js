@@ -203,7 +203,7 @@ export class ChatStore {
   /**
    * 按 QQ 消息 id 更新一条已存档消息（文本/补媒体），并落盘。
    * 用途：read_forward 工具把"合并转发占位符"永久升级成展开后的文本
-   * —— 一次展开，以后谁（模型/存档页/金句）都直接读到内容。
+   * —— 一次展开，以后谁（模型/存档页）都直接读到内容。
    */
   updateByMid(chatKey, mid, { text, appendMedia = [] } = {}) {
     const st = this.#state(chatKey);

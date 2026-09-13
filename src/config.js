@@ -4,6 +4,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { PERSONAS } from './personas.js';
 import { sliderToTier } from './tier-slider.js';   // 零依赖模块，避免循环依赖
+import { DEFAULT_RESPONSE_RULES, normalizeResponseRules } from './response-rules.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 export const ROOT = path.resolve(__dirname, '..');
@@ -134,6 +135,7 @@ export const DEFAULT_CONFIG = {
   wakeDelayMs: 2000,        // 空闲时收到消息到发起运行的防抖窗口（等连发聚成一批）
   drainDelayMs: 1200,       // 一次运行结束后发现还有未读，到下一次运行的间隔
   maxConcurrentRuns: 2,     // 全局同时进行的 agent 运行数
+  responseRules: structuredClone(DEFAULT_RESPONSE_RULES),
   // 发送保护
   send: {
     minGapMs: 1000,         // 相邻两条消息最小间隔
@@ -261,6 +263,7 @@ export function getConfig() {
 /** 更新并持久化配置（浅合并到当前值；patch 里传对象字段则整体替换该字段）。 */
 export function updateConfig(patch) {
   currentConfig = deepMerge(getConfig(), patch);
+  currentConfig.responseRules = normalizeResponseRules(currentConfig.responseRules);
 
   // ── 响应档位：以滑条位置为唯一真相，派生 tier 与随机概率 ──
   // 前端只负责上报滑条位置（contextSliderPos），档位和概率一律由这里换算。

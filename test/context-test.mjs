@@ -14,6 +14,8 @@ import { selectWindow, recallMemories, primarySubjects, assertContextAllowed, hi
 import { DATA_DIR, DEFAULT_CONFIG, setRuntimeConfig } from '../src/config.js';
 
 const cfg = structuredClone(DEFAULT_CONFIG);
+// These existing integration scenarios explicitly exercise the legacy response gate.
+cfg.responseRules.groupMode = 'legacy';
 cfg.providersImported = true;
 cfg.memory.consolidateEnabled = false;
 cfg.sticker.enabled = false;

@@ -13,7 +13,14 @@ function compileSchema(schema) {
 const object = (x) => x !== null && typeof x === 'object' && !Array.isArray(x);
 const qq = /^[1-9]\d{0,14}$/;
 const chat = /^(group|private):[1-9]\d{0,14}$/;
-const reserved = new Set(['帮助', '权限', '确认', '取消']);
+const builtinCommands = Object.freeze({
+  '电脑状态': Object.freeze({ tool: 'builtin:get_computer_status', description: '查看 CPU、GPU、内存、磁盘和运行时间（无参数）' })
+});
+const reserved = new Set(['帮助', '权限', '确认', '取消', ...Object.keys(builtinCommands)]);
+function commandDefinition(name, cfg = getConfig().permissions || {}) {
+  if (Object.hasOwn(builtinCommands, name)) return builtinCommands[name];
+  return Object.hasOwn(cfg.commands || {}, name) ? cfg.commands[name] : null;
+}
 export const toolKey = (def) => def.permissionKey || `builtin:${def.name}`;
 const hash = (x) => createHash('sha256').update(JSON.stringify(x) ?? 'null').digest('hex');
 const fail = (message) => { throw new Error(message); };
@@ -113,7 +120,7 @@ export class PermissionService {
     const allowed = cfg.allow?.[kind === 'group' ? 'groups' : 'private'] || [];
     const denied = cfg.deny?.[kind === 'group' ? 'groups' : 'private'] || [];
     if (denied.map(String).includes(id) || !(allowed.length ? allowed.map(String).includes(id) : cfg.allowAllWhenEmpty === true)) fail('当前会话不在允许范围');
-    if (grant.command && hash(cfg.permissions?.commands?.[grant.command]) !== grant.commandHash) fail('命令配置已变化，请重新发送');
+    if (grant.command && hash(commandDefinition(grant.command)) !== grant.commandHash) fail('命令配置已变化，请重新发送');
   }
   visible(def, chatKey) {
     const p = this.#policy(def);
@@ -141,7 +148,7 @@ export class PermissionService {
       this.check(ctx, def, args);
       const p = this.#policy(def), g = this.#grants.get(ctx);
       if (g?.used) fail('本次授权已使用，请重新发起命令');
-      const limit = p.maxCallsPerMinute || (p.role === 'admin' ? 5 : null);
+      const limit = p.maxCallsPerMinute || def.defaultMaxCallsPerMinute || (p.role === 'admin' ? 5 : null);
       if (limit) {
         const ids = g ? [g.senderId] : [...new Set((ctx.session.trigger || []).filter((m) => !m.self).map((m) => String(m.senderId)))];
         this.#rate([`tool:${toolKey(def)}:chat:${ctx.chatKey}`, ...ids.map((id) => `tool:${toolKey(def)}:qq:${id}`)], limit);
@@ -172,7 +179,7 @@ export class PermissionService {
     const cfg = getConfig().permissions || {}, admin = isAdmin(entry.senderId);
     if (parsed.name === '权限') return { reply: admin ? '你是机器人管理员。受限工具请通过 /命令名 调用。' : '你是普通用户，可以聊天和使用已开放的工具。' };
     if (parsed.name === '帮助') return { reply: admin
-      ? ['/权限', '/确认 编号', '/取消 编号', ...Object.entries(cfg.commands || {}).map(([name, c]) => `/${name} JSON参数${c.description ? `：${c.description}` : ''}`)].join('\n')
+      ? ['/权限', '/确认 编号', '/取消 编号', ...Object.entries(builtinCommands).map(([name, c]) => `/${name}：${c.description}`), ...Object.entries(cfg.commands || {}).filter(([name]) => !reserved.has(name)).map(([name, c]) => `/${name} JSON参数${c.description ? `：${c.description}` : ''}`)].join('\n')
       : '可用命令：/帮助、/权限。' };
     if (!admin) fail('此命令需要机器人管理员权限');
     let grant, args, def;
@@ -183,11 +190,11 @@ export class PermissionService {
       if (parsed.name === '取消') return { reply: '已取消。' };
       ({ grant, args } = pending);
       this.#assertSource(ctx, grant);
-      def = (await resolveDefs()).find((d) => toolKey(d) === grant.tool);
+      def = (await resolveDefs(grant.tool)).find((d) => toolKey(d) === grant.tool);
       if (!def || hash([toolKey(def), def.parameters, def.authorizationVersion]) !== pending.definitionHash) fail('工具定义已变化，请重新发送命令');
       grant.confirmed = true;
     } else {
-      const command = Object.hasOwn(cfg.commands || {}, parsed.name) ? cfg.commands[parsed.name] : null;
+      const command = commandDefinition(parsed.name, cfg);
       if (!command) fail('未注册此命令，请查看 /帮助');
       try { args = parsed.input ? JSON.parse(parsed.input) : {}; } catch { fail('参数应为 JSON 对象，例如 /命令名 {"target":"demo"}'); }
       if (!object(args) || JSON.stringify(args).length > 8000) fail('参数必须是 JSON 对象，且不超过 8000 字符');
@@ -195,7 +202,7 @@ export class PermissionService {
         command: parsed.name, commandHash: hash(command), tool: command.tool, argsHash: hash(args),
         expiresAt: Math.min(now + 120000, Number(entry.receivedAt || entry.ts) + 300000) };
       this.#assertSource(ctx, grant);
-      def = (await resolveDefs()).find((d) => toolKey(d) === grant.tool);
+      def = (await resolveDefs(grant.tool)).find((d) => toolKey(d) === grant.tool);
       if (!def) fail('此工具当前不可用，请在控制台检查工具注册与聊天范围');
       grant.policyHash = hash(this.#policy(def));
     }
@@ -212,7 +219,10 @@ export class PermissionService {
     ctx.session.sideEffectAttempted = true;
     const result = await this.execute(ctx, def, args);
     ctx.session.messages.push({ role: 'tool', name: def.name, content: result.content, isError: !!result.isError });
-    return { reply: result.isError ? '执行失败，详情已记录在控制台。' : `/${grant.command} 执行完成。`, isError: !!result.isError };
+    const reply = result.isError ? '执行失败，详情已记录在控制台。'
+      : def.formatCommandResult ? def.formatCommandResult(result) : `/${grant.command} 执行完成。`;
+    return { reply, isError: !!result.isError,
+      beforeReply: !result.isError && def.formatCommandResult ? () => this.check(ctx, def, args) : null };
   }
 }
 

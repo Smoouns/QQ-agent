@@ -16,7 +16,7 @@ app.setAppUserModelId('cn.kondius.qq-agent');
 // Kondius 钦定：所有数据都存在安装目录下，不往 %APPDATA% 塞。
 //   压缩包用户：data 本来就在压缩包目录里，直接用（项目内 data/）；
 //   安装版用户：安装目录/exe 旁边的 data/。选压缩包目录当安装目录时
-//   天然接管里面的 data/（config、记忆、聊天记录、telemetry id 全保留），零迁移零 bug。
+//   天然接管里面的 data/（config、记忆、聊天记录全保留），零迁移零 bug。
 // NSIS 覆盖安装只替换它自己装的文件，运行时生成的 data/ 不在清单里 → 升级不丢数据。
 // 兼容兜底：外置 %APPDATA% 时期（2026-09-06 短命版本）的数据自动搬回安装目录。
 function resolveDataDir() {
@@ -133,7 +133,7 @@ function createWindow(port) {
     if (level >= 2) console.log(`[renderer] ${message} (${sourceId}:${line})`);
   });
   mainWindow.loadURL(`http://127.0.0.1:${port}/`).catch((error) => console.error('[window] loadURL 失败:', error));
-  // 外部链接（金句墙/意见墙/上传成功提示里的网址等）一律交给系统默认浏览器，不在应用内弹新窗口
+  // 用户点击的外部链接一律交给系统默认浏览器，不在应用内弹新窗口
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
     if (/^https?:\/\//.test(url)) shell.openExternal(url);
     return { action: 'deny' };

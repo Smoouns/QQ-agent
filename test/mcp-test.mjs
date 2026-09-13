@@ -129,6 +129,7 @@ try {
 
   // 实际 API 和编排器集成；HTTP 模型由本机桩替代，不连接真实 QQ。
   const cfg = structuredClone(DEFAULT_CONFIG);
+  cfg.responseRules.groupMode = 'legacy'; // This suite verifies MCP execution with the original all-message gate.
   cfg.memory.consolidateEnabled = false;
   cfg.sticker.enabled = false;
   cfg.webSearch.enabled = false;

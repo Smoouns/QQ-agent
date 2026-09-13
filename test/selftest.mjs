@@ -289,6 +289,7 @@ refs:
     maxConcurrentRuns: 2,
     send: { minGapMs: 10, maxGapMs: 20, byLengthMs: 0, maxPerMinute: 100, maxPerHour: 1000, hardSplitAt: 4000 },
     proactive: { enabled: false },
+    responseRules: { groupMode: 'legacy' },
     memory: { consolidateEnabled: false },
     sticker: { enabled: true, collectEnabled: true },
     store: { maxMessagesPerChat: 0, pastStateLimit: 80, pastStateMaxChars: 6000, keepSessionFiles: 100 },
@@ -1343,7 +1344,7 @@ refs:
     assert.ok(msgs.text.includes('转发者A: 第一段转发内容，谁懂'), '应展开文字节点');
     assert.ok(msgs.text.includes('转发者B'), '应展开带图节点');
     const imgMedia = (msgs.media || []).find((x) => x.file === 'fwd.png');
-    assert.ok(imgMedia, '转发里的图片应进 media（取图/金句可用）');
+    assert.ok(imgMedia, '转发里的图片应进 media（按需取图可用）');
     assert.ok(String(imgMedia.url).includes('img.png'), 'media 应带新鲜 url');
     pass('合并转发聊天记录：get_forward_msg 展开为可读文本 + 图片进 media');
   }
