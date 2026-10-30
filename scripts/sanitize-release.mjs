@@ -104,8 +104,9 @@ function resetConfig() {
   }
 
   // ── 搜索服务 Key（含自定义的多个）──
+  if (cfg.imageGeneration) set(cfg.imageGeneration, 'apiKey', '');
   if (cfg.webSearch) {
-    for (const k of ['deepseek', 'zhipu', 'bocha', 'baidu', 'metaso', 'custom']) {
+    for (const k of ['opencodex', 'deepseek', 'zhipu', 'bocha', 'baidu', 'metaso', 'custom']) {
       if (cfg.webSearch[k] && 'apiKey' in cfg.webSearch[k]) {
         cfg.webSearch[k].apiKey = '';
         cleared.push(`webSearch.${k}.apiKey`);
@@ -214,6 +215,9 @@ if (!SCAN_ONLY) {
   resetConfig();
   rmrf('messages', '聊天存档');
   rmrf('sessions', '会话留档');
+  rmrf('image-assets', '生成和发送的图片');
+  rmrf('image-exports', '手动导出的图片');
+  rmrf('image-budget', '会话生图预算记录');
   rmrf('memory', '记忆');
   rmrf('stickers.json', '表情库');
   rmrf('usage-today.json', '今日用量');

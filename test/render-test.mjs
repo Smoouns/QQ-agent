@@ -108,7 +108,7 @@ try {
 
   // 取出渲染函数并执行
   const sections = [
-    'renderSettingsSection', 'renderApiSection', 'renderSearchSection', 'renderMcpSection', 'renderPermissionsSection',
+    'renderSettingsSection', 'renderApiSection', 'renderSearchSection', 'renderImageSection', 'renderMcpSection', 'renderPermissionsSection',
     'renderMemorySettingsSection', 'renderPersonaSection', 'renderAllowSection',
     'renderChatSection', 'renderDesktopSection', 'renderOnebotSection',
     'renderPersonaPicker', 'renderHealthCard'
@@ -144,6 +144,104 @@ try {
       console.log('  FAIL  ' + name + ' 抛错: ' + (e && e.message));
       results.push({ name, err: e && e.message });
     }
+  }
+
+  console.log('\n=== OpenCodex 搜索设置与测试按钮 ===');
+  {
+    const savedFetch = sandbox.fetch;
+    try {
+      const searchConfig = structuredClone(cfg);
+      searchConfig.webSearch.provider = 'opencodex';
+      delete searchConfig.webSearch.opencodex.apiKey;
+      searchConfig.webSearch.opencodex.hasApiKey = true;
+      const html = ctx.renderSearchSection(searchConfig);
+      if (!html.includes('value="opencodex" selected') || !html.includes('id="opencodex-search-fields" style=""') || !html.includes('gpt-6-luna') || !html.includes('测试已保存')) throw new Error('搜索选项或表单未正确渲染');
+      pass++; console.log('  OK   OpenCodex 搜索设置和测试入口可渲染');
+      let posted;
+      sandbox.fetch = async (url, options) => {
+        if (url !== '/api/config') return savedFetch(url, options);
+        posted = JSON.parse(options.body);
+        return { ok: true, json: async () => ({ config: searchConfig }) };
+      };
+      vm.runInContext(`state.config = ${JSON.stringify(searchConfig)}; state.settingsSection = 'search';`, ctx);
+      document.querySelector('#cfg-searchprovider').value = 'opencodex';
+      document.querySelector('#cfg-ocx-searchurl').value = 'http://127.0.0.1:10100/v1';
+      document.querySelector('#cfg-ocx-searchmodel').value = 'gpt-6-luna';
+      document.querySelector('#cfg-ocx-searchtimeout').value = '45';
+      document.querySelector('#cfg-ocx-searchkey').value = '******';
+      document.querySelector('#cfg-ocx-clearkey').checked = false;
+      await ctx.saveConfig();
+      if (posted.webSearch.provider !== 'opencodex' || posted.webSearch.opencodex.timeoutMs !== 45000 || 'apiKey' in posted.webSearch.opencodex || 'api' in posted) throw new Error('搜索保存覆盖了聊天设置或密钥');
+      document.querySelector('#cfg-ocx-searchkey').value = 'new-proxy-key';
+      await ctx.saveConfig();
+      if (posted.webSearch.opencodex.apiKey !== 'new-proxy-key') throw new Error('新 Key 未保存');
+      document.querySelector('#cfg-ocx-clearkey').checked = true;
+      await ctx.saveConfig();
+      if (posted.webSearch.opencodex.apiKey !== '') throw new Error('显式清除 Key 未生效');
+      pass++; console.log('  OK   搜索设置独立保存，掩码保留 Key，可更新或显式清除');
+      document.querySelector('#cfg-ocx-clearkey').checked = false;
+      document.querySelector('#cfg-search-test-query').value = '我的测试问题';
+      let release, calls = 0;
+      sandbox.fetch = async (url, options) => {
+        if (url !== '/api/test/search') return savedFetch(url, options);
+        calls++;
+        if (JSON.parse(options.body).query !== '我的测试问题') throw new Error('查询未传递');
+        await new Promise((r) => { release = r; });
+        return { ok: true, json: async () => ({ ok: true, provider: 'opencodex', latencyMs: 1234, result: { searched: true, searchCalls: 1, summary: '<img src=x onerror=alert(1)>', results: [{ title: '官方来源', url: 'https://example.org' }] } }) };
+      };
+      const pending = ctx.testSavedSearch(); await ctx.testSavedSearch();
+      if (calls !== 1 || !document.querySelector('#test-saved-search-btn').disabled) throw new Error('没有阻止重复测试');
+      release(); await pending;
+      const output = document.querySelector('#saved-search-test-result');
+      if (!output.textContent.includes('官方来源') || !output.textContent.includes('1.2 秒') || !output.textContent.includes('<img') || output.innerHTML.includes('<img') || document.querySelector('#test-saved-search-btn').disabled) throw new Error('搜索结果未安全显示或按钮未恢复');
+      pass++; console.log('  OK   测试按钮阻止双击，展示耗时、调用证据和来源，结果只作为文本显示');
+      sandbox.fetch = async () => ({ ok: true, json: async () => ({ ok: false, error: '未返回已完成的 web_search 调用' }) });
+      await ctx.testSavedSearch();
+      if (!output.textContent.includes('测试失败') || !output.textContent.includes('web_search') || document.querySelector('#test-saved-search-btn').disabled) throw new Error('搜索失败提示或重试按钮异常');
+      pass++; console.log('  OK   假搜索错误可见，失败后可再次测试');
+    } catch (e) { fail++; console.log('  FAIL  OpenCodex 搜索设置：' + e.message); }
+    finally { sandbox.fetch = savedFetch; vm.runInContext(`state.config = ${JSON.stringify(cfg)}; state.settingsSection = 'api';`, ctx); }
+  }
+
+  console.log('\n=== 图片与生图设置保存 ===');
+  {
+    const oldFetch = sandbox.fetch;
+    try {
+      const imageConfig = structuredClone(cfg);
+      delete imageConfig.imageGeneration.apiKey;
+      imageConfig.imageGeneration.hasApiKey = true;
+      vm.runInContext(`state.config = ${JSON.stringify(imageConfig)}; state.settingsSection = 'images';`, ctx);
+      const html = ctx.renderSettingsSection(imageConfig);
+      if (!html.includes('cfg-image-limit') || !html.includes('value="5"') || !html.includes('北京时间')) throw new Error('每日 5 次预算未正确显示');
+      pass++; console.log('  OK   图片设置渲染和每日 5 次默认值');
+      let posted;
+      sandbox.fetch = async (_url, options) => {
+        posted = JSON.parse(options.body);
+        return { ok: true, json: async () => ({ config: imageConfig }) };
+      };
+      for (const [id, value] of Object.entries({ url: 'http://127.0.0.1:10100/v1', key: '******', model: '', size: '1024x1024', quality: 'low', timeout: '300', limit: '5', overrides: 'group:123=2\nprivate:123=0' })) document.querySelector('#cfg-image-' + id).value = value;
+      document.querySelector('#cfg-image-enabled').checked = true;
+      document.querySelector('#cfg-image-clear-key').checked = false;
+      await ctx.saveConfig();
+      if (posted.imageGeneration.dailyLimit !== 5 || posted.imageGeneration.chatDailyLimits.__replace__['private:123'] !== 0 || 'apiKey' in posted.imageGeneration || 'api' in posted) throw new Error('独立预算或 Key 保留失败');
+      document.querySelector('#cfg-image-overrides').value = '';
+      document.querySelector('#cfg-image-key').value = 'new-image-key';
+      await ctx.saveConfig();
+      if (Object.keys(posted.imageGeneration.chatDailyLimits.__replace__).length || posted.imageGeneration.apiKey !== 'new-image-key') throw new Error('删除覆盖或更新 Key 失败');
+      document.querySelector('#cfg-image-clear-key').checked = true;
+      await ctx.saveConfig();
+      if (posted.imageGeneration.apiKey !== '') throw new Error('显式清除 Key 失败');
+      pass++; console.log('  OK   生图设置独立保存，覆盖可删除，Key 保留/更新/清除');
+      document.querySelector('#image-budget-chat').value = 'group:123';
+      sandbox.fetch = async (url) => {
+        if (!url.includes('chatKey=group%3A123')) throw new Error('查询会话未传递');
+        return { ok: true, json: async () => ({ date: '2026-10-28', used: 2, limit: 5, remaining: 3 }) };
+      };
+      await ctx.checkImageBudget();
+      if (!document.querySelector('#image-budget-result').textContent.includes('已用 2 / 5')) throw new Error('用量未显示');
+      pass++; console.log('  OK   查询当前会话今日已用次数');
+    } catch (e) { fail++; console.log('  FAIL  生图设置：' + e.message); }
+    finally { sandbox.fetch = oldFetch; vm.runInContext(`state.config = ${JSON.stringify(cfg)}; state.settingsSection = 'api';`, ctx); }
   }
 
   // Exercise the actual save handler: a rendered form alone does not verify its HTTP payload.

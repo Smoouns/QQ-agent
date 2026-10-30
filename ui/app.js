@@ -1207,14 +1207,28 @@ function renderChatMessages() {
     </div>
     <div class="chat-toolbar">
       <button class="btn btn-small" id="chat-wake-btn">唤醒一次处理</button>
+      <button class="btn btn-small" id="chat-agent-reply-btn" title="跳过自动触发规则，调用模型并向当前 QQ 会话发送回复">测试 Agent 回复</button>
       <button class="btn btn-small" id="chat-read-btn">全部标为已读</button>
       <input type="text" id="test-send-text" placeholder="手动发一条测试消息" style="flex:1" />
       <button class="btn btn-small" id="chat-testsend-btn">发送</button>
     </div>
+    <div class="hint" id="chat-agent-reply-status" role="status">测试 Agent 回复会调用模型并向当前 QQ 会话发言；没有未读消息时使用最近一条可见用户消息。</div>
     <table class="archive-table"><tbody id="chat-msg-body"></tbody></table>
     <div class="list-more muted" id="chat-msg-more"></div>`;
 
   // 工具栏事件：只在这里绑一次
+  $('#chat-agent-reply-btn').addEventListener('click', async () => {
+    const button = $('#chat-agent-reply-btn'), status = $('#chat-agent-reply-status');
+    if (button.disabled) return;
+    button.disabled = true;
+    status.textContent = '正在发起 Agent 测试…';
+    try {
+      await api(`/api/chats/${key.replace(':', '_')}/agent-reply`, { method: 'POST', body: '{}' });
+      status.textContent = '已启动，请在「会话」页查看模型调用与实际回复结果。';
+      refreshStatus();
+    } catch (error) { status.textContent = `无法发起测试：${error.message}`; }
+    finally { button.disabled = false; }
+  });
   $('#chat-wake-btn').addEventListener('click', async () => {
     await api(`/api/chats/${key.replace(':', '_')}/wake`, { method: 'POST', body: '{}' });
     refreshStatus();
@@ -2515,6 +2529,7 @@ function renderSettingsSidebar() {
   const menu = [
     ['api', '模型 API'],
     ['search', '搜索服务'],
+    ['images', '图片与生图'],
     ['mcp', '工具（MCP）'],
     ['permissions', '权限与命令'],
     ['memory', '记忆'],
@@ -2557,6 +2572,7 @@ function renderSettingsSection(c) {
   const sections = {
     api: () => renderApiSection(c),
     search: () => renderSearchSection(c),
+    images: () => renderImageSection(c),
     permissions: () => renderPermissionsSection(c),
     memory: () => renderMemorySettingsSection(c),
     persona: () => renderPersonaSection(c),
@@ -2572,6 +2588,33 @@ function renderSettingsSection(c) {
       <span id="cfg-save-result" class="muted"></span>
     </div>
     ${render()}`;
+}
+
+function renderImageSection(c) {
+  const g = c.imageGeneration || {};
+  return `<h3>图片与生图</h3>
+    <p class="hint">支持文字生图和参考图改图，每次生成一张。可从网页或聊天消息导入参考图，再按描述生成并发送；最多 4 张参考图。导入、查看和重发已有图片不扣生图次数，文生图与图生图共用下方额度。</p>
+    <div class="checkbox-row"><input type="checkbox" id="cfg-image-enabled" ${g.enabled !== false ? 'checked' : ''} /><label for="cfg-image-enabled">启用生图工具</label></div>
+    <div class="field"><label>生图接口 Base URL</label><input id="cfg-image-url" value="${esc(g.baseUrl || 'http://127.0.0.1:10100/v1')}" /><div class="hint">默认通过本机 OpenCodex 的 /images/generations，使用其配置的生图上游。</div></div>
+    <div class="field"><label>接口 Key（可选）</label><input type="password" autocomplete="new-password" id="cfg-image-key" value="${g.hasApiKey ? '******' : ''}" placeholder="留空保持已保存的 Key" /></div>
+    <div class="checkbox-row"><input type="checkbox" id="cfg-image-clear-key" /><label for="cfg-image-clear-key">清除已保存的生图接口 Key</label></div>
+    <div class="field"><label>生图模型（留空由上游选择）</label><input id="cfg-image-model" value="${esc(g.model || '')}" placeholder="不要填聊天模型 gpt-6-luna" /></div>
+    <div class="field-row">
+      <div class="field"><label>尺寸</label><select id="cfg-image-size">${['1024x1024', '1536x1024', '1024x1536', 'auto'].map(x => `<option value="${x}" ${x === (g.size || '1024x1024') ? 'selected' : ''}>${x}</option>`).join('')}</select></div>
+      <div class="field"><label>质量</label><select id="cfg-image-quality">${[['low', '低'], ['medium', '中'], ['high', '高'], ['auto', '自动']].map(([x,l]) => `<option value="${x}" ${x === (g.quality || 'low') ? 'selected' : ''}>${l}</option>`).join('')}</select></div>
+      <div class="field"><label>超时（秒）</label><input type="number" min="1" max="600" id="cfg-image-timeout" value="${esc((g.timeoutMs || 300000) / 1000)}" /></div>
+    </div>
+    <div class="field"><label>每个会话每日生图次数</label><input type="number" min="0" max="1000" id="cfg-image-limit" value="${esc(g.dailyLimit ?? 5)}" /><div class="hint">每个群聊和私聊独立计算，北京时间零点重置。0 表示禁止生图。按已发起请求扣次，失败或超时也计入，重启不会清零。次数上限不是金额上限，单次成本取决于上游及画质。</div></div>
+    <div class="field"><label>会话单独预算（可选，一行一个）</label><textarea id="cfg-image-overrides" rows="4" placeholder="group:123456=5&#10;private:123456=2">${esc(Object.entries(g.chatDailyLimits || {}).map(([key, n]) => `${key}=${n}`).join('\n'))}</textarea><div class="hint">删掉一行后，该会话恢复使用默认次数。</div></div>
+    <div class="field"><label>查询今日用量</label><input id="image-budget-chat" placeholder="group:群号 或 private:QQ号" /><button class="btn" id="image-budget-check">查询已保存配置下的用量</button><div id="image-budget-result" class="hint"></div></div>`;
+}
+
+async function checkImageBudget() {
+  const output = $('#image-budget-result');
+  try {
+    const r = await api('/api/images/budget?chatKey=' + encodeURIComponent($('#image-budget-chat').value.trim()));
+    output.textContent = `${r.date}（北京时间）：已用 ${r.used} / ${r.limit} 次，剩余 ${r.remaining} 次。`;
+  } catch (e) { output.textContent = `查询失败：${e.message}`; }
 }
 
 function renderPermissionsSection(c) {
@@ -2702,6 +2745,7 @@ function renderSearchSection(c) {
     <div class="field"><label>搜索提供方</label>
       <select id="cfg-searchprovider">
         <option value="bing" ${prov === 'bing' ? 'selected' : ''}>Bing 网页解析</option>
+        <option value="opencodex" ${prov === 'opencodex' ? 'selected' : ''}>OpenCodex 原生联网搜索</option>
         <option value="deepseek" ${prov === 'deepseek' ? 'selected' : ''}>DeepSeek 原生搜索</option>
         <option value="zhipu" ${prov === 'zhipu' ? 'selected' : ''}>智谱 Web Search</option>
         <option value="bocha" ${prov === 'bocha' ? 'selected' : ''}>博查 AI Search</option>
@@ -2717,6 +2761,21 @@ function renderSearchSection(c) {
       </div>
     </div>
     <div class="field" id="bing-search-fields" style="${prov === 'bing' ? '' : 'display:none'}"><label>搜索地址（高级：可替换为兼容 Bing 结果格式的引擎）</label><input type="text" id="cfg-searchurl" value="${esc(c.webSearch?.searchUrl || 'https://cn.bing.com/search')}" /></div>
+    <div id="opencodex-search-fields" style="${prov === 'opencodex' ? '' : 'display:none'}">
+      <p class="hint">通过本机 OpenCodex 的已登录账号执行搜索，聊天模型保持原设置。搜索会使用订阅额度。</p>
+      <div class="field"><label>OpenCodex 接口地址</label><input type="text" id="cfg-ocx-searchurl" value="${esc(c.webSearch?.opencodex?.baseUrl || 'http://127.0.0.1:10100/v1')}" /></div>
+      <div class="field-row">
+        <div class="field"><label>搜索模型</label><input type="text" id="cfg-ocx-searchmodel" value="${esc(c.webSearch?.opencodex?.model || 'gpt-6-luna')}" /></div>
+        <div class="field"><label>超时（秒）</label><input type="number" min="1" max="300" id="cfg-ocx-searchtimeout" value="${esc((c.webSearch?.opencodex?.timeoutMs || 120000) / 1000)}" /></div>
+      </div>
+      <div class="field"><label>OpenCodex 接口 Key（可选）</label>
+        <div style="display:flex;gap:8px">
+          <input type="password" id="cfg-ocx-searchkey" value="${esc(c.webSearch?.opencodex?.hasApiKey ? '******' : '')}" placeholder="未启用接口鉴权时无需填写；留空保持已存 Key" autocomplete="new-password" style="flex:1" />
+          <button class="btn btn-small" id="cfg-ocx-searchkey-toggle" type="button">显示</button>
+        </div>
+        <div class="checkbox-row"><input type="checkbox" id="cfg-ocx-clearkey" /><label for="cfg-ocx-clearkey">清除已保存的搜索 Key</label></div>
+      </div>
+    </div>
     <div class="field-row" id="deepseek-search-fields" style="${prov === 'deepseek' ? '' : 'display:none'}">
       <div class="field"><label>DeepSeek 搜索 API Key（留空用环境变量 DEEPSEEK_API_KEY）</label>
         <div style="display:flex;gap:8px">
@@ -2758,6 +2817,11 @@ function renderSearchSection(c) {
         <button class="btn btn-small" id="cfg-metaso-key-toggle" type="button">显示</button>
       </div></div>
 
+    <div class="field"><label>测试查询</label><input type="text" id="cfg-search-test-query" maxlength="120" value="搜索 Node.js 官方文档，AbortSignal.timeout(delay) 的 delay 单位是什么？" /></div>
+    <button class="btn btn-small" id="test-saved-search-btn" type="button">测试已保存的搜索服务</button>
+    <p class="hint">修改配置后请先保存。测试会调用搜索服务并展示来源，不发送 QQ 消息。</p>
+    <pre id="saved-search-test-result" role="status" style="white-space:pre-wrap;overflow-wrap:anywhere"></pre>
+
     <h3>添加自定义搜索服务</h3>
     <div class="field-row">
       <div class="field"><label>名称（自己辨认用）</label>
@@ -2781,6 +2845,25 @@ function renderSearchSection(c) {
       <span id="add-search-provider-hint" class="muted" style="font-size:12px"></span>
     </div>
   `;
+}
+
+async function testSavedSearch() {
+  const button = $('#test-saved-search-btn'), output = $('#saved-search-test-result');
+  if (!button || button.disabled) return;
+  const query = ($('#cfg-search-test-query')?.value || '').trim();
+  if (!query) { output.textContent = '请输入测试查询'; return; }
+  button.disabled = true; output.textContent = '正在搜索，请稍候…';
+  try {
+    const r = await api('/api/test/search', { method: 'POST', body: JSON.stringify({ query }) });
+    if (!r.ok) throw new Error(r.error || '搜索失败');
+    const result = r.result || {};
+    output.textContent = [
+      `服务：${r.provider}；耗时：${(r.latencyMs / 1000).toFixed(1)} 秒${result.searched ? `；已验证 ${result.searchCalls} 次原生搜索调用` : ''}`,
+      result.summary || '',
+      ...(result.results || []).map((s, i) => `${i + 1}. ${s.title}\n${s.url}\n${s.snippet || ''}`)
+    ].filter(Boolean).join('\n\n');
+  } catch (error) { output.textContent = `测试失败：${error?.message || error}`; }
+  finally { button.disabled = false; }
 }
 
 function renderMcpSection() {
@@ -3306,6 +3389,7 @@ function renderOnebotSection(c) {
 }
 
 function bindSettingsEvents(c) {
+  $('#image-budget-check')?.addEventListener('click', checkImageBudget);
   if (state.settingsSection === 'mcp') { bindMcpPage(); return; }
   // 保存当前区块设置（通用保存按钮）。只有当前区块的字段才会被读取，不会 null 报错。
   const saveCfgBtn = $('#save-cfg-btn');
@@ -3330,6 +3414,7 @@ function bindSettingsEvents(c) {
     const v = searchProviderSel.value;
     const fields = {
       bing: '#bing-search-fields',
+      opencodex: '#opencodex-search-fields',
       deepseek: '#deepseek-search-fields',
       zhipu: '#zhipu-search-fields',
       bocha: '#bocha-search-fields',
@@ -3344,6 +3429,8 @@ function bindSettingsEvents(c) {
     const manage = $('#custom-provider-manage');
     if (manage) manage.style.display = v.startsWith('custom:') ? '' : 'none';
   });
+
+  $('#test-saved-search-btn')?.addEventListener('click', testSavedSearch);
 
   // ── 自定义搜索服务：添加 / 测试 / 删除 ──
   $('#add-search-provider-btn')?.addEventListener('click', async () => {
@@ -3598,6 +3685,7 @@ function bindSettingsEvents(c) {
   const pwdToggles = [
     ['cfg-apikey-toggle', 'cfg-apikey'],
     ['new-apikey-toggle', 'new-apikey'],
+    ['cfg-ocx-searchkey-toggle', 'cfg-ocx-searchkey'],
     ['cfg-ds-searchkey-toggle', 'cfg-ds-searchkey'],
     ['cfg-zhipu-key-toggle', 'cfg-zhipu-key'],
     ['cfg-bocha-key-toggle', 'cfg-bocha-key'],
@@ -3638,6 +3726,7 @@ function bindSettingsEvents(c) {
   // 输入框 id -> 搜索服务字段名（/api/config 里的搜索 Key 是脱敏的，
   // 所以“显示”必须向后端专用端点要明文，不能直接读 state.config）
   const SEARCH_KEY_FIELDS = {
+    'cfg-ocx-searchkey': 'opencodex',
     'cfg-ds-searchkey': 'deepseek',
     'cfg-zhipu-key': 'zhipu',
     'cfg-bocha-key': 'bocha',
@@ -4504,6 +4593,23 @@ async function saveConfig({ quiet = false } = {}) {
 
   const patch = {};
 
+  if (sec === 'images') {
+    const g = c.imageGeneration || {}, limits = {};
+    for (const line of val('#cfg-image-overrides').split(/\r?\n/).map(x => x.trim()).filter(Boolean)) {
+      const m = /^(group|private):([1-9]\d{0,19})\s*=\s*(\d+)$/.exec(line);
+      if (!m || Number(m[3]) > 1000) throw new Error('会话预算格式应为 group:群号=次数 或 private:QQ号=次数，次数 0–1000');
+      limits[`${m[1]}:${m[2]}`] = Number(m[3]);
+    }
+    const key = val('#cfg-image-key').trim();
+    patch.imageGeneration = {
+      ...g, enabled: chk('#cfg-image-enabled', true), baseUrl: val('#cfg-image-url', g.baseUrl).trim(),
+      model: val('#cfg-image-model').trim(), size: val('#cfg-image-size', '1024x1024'), quality: val('#cfg-image-quality', 'low'),
+      timeoutMs: Number(val('#cfg-image-timeout', 300)) * 1000, dailyLimit: Number(val('#cfg-image-limit', 5)),
+      chatDailyLimits: { __replace__: limits },
+      ...(key && key !== '******' ? { apiKey: key } : {}), ...(chk('#cfg-image-clear-key') ? { apiKey: '' } : {})
+    };
+  }
+
   if (sec === 'permissions') {
     const result = await api('/api/permissions', { method: 'POST', body: JSON.stringify({
       adminQQs: parseList(val('#cfg-admin-qqs')), adminStyle: val('#cfg-admin-style'),
@@ -4583,6 +4689,7 @@ async function saveConfig({ quiet = false } = {}) {
 
   if (sec === 'search') {
     // 搜索 API Key：****** = 保持原 Key 不变；明文或新输入才更新
+    const enteredOcxKey = val('#cfg-ocx-searchkey', '').trim();
     const enteredDsKey = val('#cfg-ds-searchkey', '').trim();
     const enteredZhipuKey = val('#cfg-zhipu-key', '').trim();
     const enteredBochaKey = val('#cfg-bocha-key', '').trim();
@@ -4593,6 +4700,14 @@ async function saveConfig({ quiet = false } = {}) {
       enabled: chk('#cfg-websearch', c.webSearch?.enabled !== false),
       provider: val('#cfg-searchprovider', c.webSearch?.provider || 'bing'),
       searchUrl: val('#cfg-searchurl', c.webSearch?.searchUrl || 'https://cn.bing.com/search').trim() || 'https://cn.bing.com/search',
+      opencodex: {
+        ...(c.webSearch?.opencodex || {}),
+        baseUrl: val('#cfg-ocx-searchurl', c.webSearch?.opencodex?.baseUrl || 'http://127.0.0.1:10100/v1').trim(),
+        model: val('#cfg-ocx-searchmodel', c.webSearch?.opencodex?.model || 'gpt-6-luna').trim(),
+        timeoutMs: Math.max(1, Math.min(300, Number(val('#cfg-ocx-searchtimeout', (c.webSearch?.opencodex?.timeoutMs || 120000) / 1000)) || 120)) * 1000,
+        ...(enteredOcxKey && enteredOcxKey !== '******' ? { apiKey: enteredOcxKey } : {}),
+        ...(chk('#cfg-ocx-clearkey', false) ? { apiKey: '' } : {})
+      },
       deepseek: {
         ...(c.webSearch?.deepseek || {}),
         ...(enteredDsKey && enteredDsKey !== '******' ? { apiKey: enteredDsKey } : {}),

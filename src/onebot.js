@@ -116,15 +116,28 @@ export class OneBotClient {
 
   /** OneBot HTTP API（发送与查询都走这里）。 */
   async call(action, params = {}, timeoutMs = 15000) {
-    const res = await fetch(`${this.httpUrl}/${action}`, {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        ...(this.httpToken ? { authorization: `Bearer ${this.httpToken}` } : {})
-      },
-      body: JSON.stringify(params),
-      signal: AbortSignal.timeout(timeoutMs)
-    });
+    let res;
+    const signal = AbortSignal.timeout(timeoutMs);
+    try {
+      res = await fetch(`${this.httpUrl}/${action}`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          ...(this.httpToken ? { authorization: `Bearer ${this.httpToken}` } : {})
+        },
+        body: JSON.stringify(params),
+        signal,
+        redirect: 'error'
+      });
+    } catch (error) {
+      const code = String(error?.cause?.code || error?.code || '');
+      const detail = signal.aborted ? `请求超时（${Math.round(timeoutMs / 1000)} 秒）`
+        : code === 'ECONNREFUSED' ? '连接被拒绝，请确认协议端和 HTTP 端口已启动'
+        : ['ECONNRESET', 'EPIPE', 'UND_ERR_SOCKET'].includes(code) ? '连接被协议端关闭，请检查请求体大小和协议端日志'
+        : '网络请求失败，请检查 OneBot HTTP 地址和连接';
+      // 不回显 URL、令牌或底层错误原文；发送中断不能证明未投递，因此绝不自动重试。
+      throw new Error(`OneBot ${action} ${detail}${/^[A-Z][A-Z0-9_]{1,40}$/.test(code) ? `（${code}）` : ''}；若为发送动作，投递结果可能未知，请先核对聊天记录`);
+    }
     if (!res.ok) {
       const hint = res.status === 426
         ? '（HTTP 426：httpUrl 可能指向了 WebSocket 端口，请检查 snowluma.httpUrl 是否为 OneBot HTTP API 地址）'
@@ -146,13 +159,25 @@ export class OneBotClient {
     return this.selfInfo?.nickname ? String(this.selfInfo.nickname) : '';
   }
 
+  get canReadLocalImageFiles() {
+    try {
+      const host = new URL(this.httpUrl).hostname.toLowerCase();
+      return host === 'localhost' || host === '[::1]' || /^127\.(?:\d{1,3}\.){2}\d{1,3}$/.test(host);
+    } catch { return false; }
+  }
+
   /** 发送消息段。返回 OneBot 响应 data（含 message_id）。 */
-  async sendSegments(kind, id, segments) {
+  async sendSegments(kind, id, segments, timeoutMs = 15000) {
     const action = kind === 'private' ? 'send_private_msg' : 'send_group_msg';
     const params = kind === 'private'
       ? { user_id: Number(id), message: segments }
       : { group_id: Number(id), message: segments };
-    return this.call(action, params);
+    // SnowLuma 当前 HTTP 接口超限会直接断开连接，提前报出可操作的错误。
+    if (segments.some((s) => s.type === 'image' && String(s.data?.file || '').startsWith('base64://'))
+        && Buffer.byteLength(JSON.stringify(params)) > 2 * 1024 * 1024) {
+      throw new Error('图片 Base64 请求超过 SnowLuma 的 2 MiB HTTP 上限；同机部署请使用自动文件传输，远程部署请使用更小的图片');
+    }
+    return this.call(action, params, timeoutMs);
   }
 
   async sendText(kind, id, text, { replyToMessageId = null, atUserId = null } = {}) {
@@ -171,7 +196,11 @@ export class OneBotClient {
     return this.sendSegments(kind, id, segments);
   }
 
-  async sendSticker(kind, id, imageUrl, { replyToMessageId = null, atUserId = null } = {}) {
+  async sendSticker(kind, id, imageUrl, options = {}) {
+    return this.sendImage(kind, id, imageUrl, options);
+  }
+
+  async sendImage(kind, id, imageUrl, { replyToMessageId = null, atUserId = null } = {}) {
     const segments = [];
     if (replyToMessageId !== undefined && replyToMessageId !== null && String(replyToMessageId).trim() !== '') {
       const rid = String(replyToMessageId).trim();
@@ -184,7 +213,7 @@ export class OneBotClient {
       segments.push({ type: 'at', data: { qq: at } });
     }
     segments.push({ type: 'image', data: { file: String(imageUrl) } });
-    return this.sendSegments(kind, id, segments);
+    return this.sendSegments(kind, id, segments, 120000);
   }
 
   async sendPoke(kind, id, targetUserId) {

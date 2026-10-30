@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { PERSONAS } from './personas.js';
 import { sliderToTier } from './tier-slider.js';   // 零依赖模块，避免循环依赖
 import { DEFAULT_RESPONSE_RULES, normalizeResponseRules } from './response-rules.js';
+import { DEFAULT_IMAGE_GENERATION, normalizeImageConfig } from './image-config.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 export const ROOT = path.resolve(__dirname, '..');
@@ -13,6 +14,7 @@ export const DATA_DIR = process.env.QQ_AGENT_DATA_DIR || path.join(ROOT, 'data')
 export const CONFIG_FILE = path.join(DATA_DIR, 'config.json');
 
 export const DEFAULT_CONFIG = {
+  imageGeneration: DEFAULT_IMAGE_GENERATION,
   permissions: { adminQQs: [], adminStyle: '', tools: {}, commands: {} },
   // OpenAI 兼容 API（必填才能跑）
   api: {
@@ -55,8 +57,14 @@ export const DEFAULT_CONFIG = {
     enabled: true,
     searchUrl: 'https://cn.bing.com/search',
     maxResults: 6,
-    // 可选：'bing' | 'deepseek' | 'zhipu' | 'bocha' | 'baidu' | 'metaso'
+    // 可选：'bing' | 'opencodex' | 'deepseek' | 'zhipu' | 'bocha' | 'baidu' | 'metaso'
     provider: 'bing',
+    opencodex: {
+      baseUrl: 'http://127.0.0.1:10100/v1',
+      apiKey: '',                  // 本机代理的接口 Key，不读取订阅登录令牌或聊天提供商 Key
+      model: 'gpt-6-luna',
+      timeoutMs: 120000
+    },
     deepseek: {
       apiKey: '',                     // 留空时回退环境变量 DEEPSEEK_API_KEY
       baseUrl: 'https://api.deepseek.com/responses',
@@ -106,10 +114,12 @@ export const DEFAULT_CONFIG = {
   },
   // 安全例外（默认全部关闭）
   security: {
+    fakeIpDnsFallback: true,                // 系统 DNS 失败或代理返回 198.18/15 时用 Cloudflare DoH 回退；仍拒绝内网
     allowPrivateImageHosts: false           // true 时图片下载允许内网地址（仅本地测试/自建图床）
   },
   // SnowLuma / OneBot v11
   snowluma: {
+    imageTransport: 'auto',     // 同机 loopback HTTP 使用内部文件；远程用 Base64。容器/转发端口不共享文件时可强制 base64。
     dir: '',                   // SnowLuma 程序目录；留空 = 自动探测项目内 ./snowluma
     autoLaunch: false,         // 应用启动时自动拉起 SnowLuma（未运行时）
     wsUrl: 'ws://127.0.0.1:3001',
@@ -262,7 +272,9 @@ export function getConfig() {
 
 /** 更新并持久化配置（浅合并到当前值；patch 里传对象字段则整体替换该字段）。 */
 export function updateConfig(patch) {
-  currentConfig = deepMerge(getConfig(), patch);
+  const candidate = deepMerge(getConfig(), patch);
+  candidate.imageGeneration = normalizeImageConfig(candidate.imageGeneration);
+  currentConfig = candidate;
   currentConfig.responseRules = normalizeResponseRules(currentConfig.responseRules);
 
   // ── 响应档位：以滑条位置为唯一真相，派生 tier 与随机概率 ──

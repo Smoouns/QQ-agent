@@ -14,6 +14,7 @@ import http from 'node:http';
 import https from 'node:https';
 import { StringDecoder } from 'node:string_decoder';
 import { getConfig } from './config.js';
+import { isFakeIp, lookupPublicHost } from './public-dns.js';
 
 const dnsLookup = dns.promises.lookup;
 
@@ -109,7 +110,7 @@ async function lookupWithTimeout(hostname) {
 }
 
 async function resolveSafeHost(hostname, { allowPrivate = false } = {}) {
-  const h = String(hostname || '').toLowerCase().replace(/^\[|\]$/g, '');
+  const h = String(hostname || '').toLowerCase().replace(/^\[|\]$/g, '').replace(/\.$/, '');
   if (!h) throw new Error('主机名为空');
   if (!allowPrivate && (h === 'localhost' || h.endsWith('.localhost') || h.endsWith('.local'))) {
     throw new Error('禁止访问内网/本机地址');
@@ -118,16 +119,28 @@ async function resolveSafeHost(hostname, { allowPrivate = false } = {}) {
     if (!allowPrivate && isPrivateIp(h)) throw new Error('禁止访问内网/本机地址');
     return h;
   }
-  let addresses;
+  let addresses, usedPublicDns = false;
   try {
     addresses = await lookupWithTimeout(h);
   } catch (error) {
-    throw new Error(`域名解析失败：${error?.message ?? error}`);
+    // 系统 DNS 偶发超时也可使用同一公共解析回退；不能以此绕过已返回的私网结果。
+    if (allowPrivate || getConfig().security?.fakeIpDnsFallback === false) {
+      throw new Error(`域名解析失败：${error?.message ?? error}`);
+    }
+    try { addresses = await lookupPublicHost(h); usedPublicDns = true; }
+    catch (fallbackError) { throw new Error(`系统 DNS 解析失败，公共 DNS 回退也失败：${fallbackError?.message ?? fallbackError}`); }
   }
   if (!addresses.length) throw new Error('域名没有解析结果');
   if (!allowPrivate) {
+    if (!usedPublicDns && addresses.every(({ address }) => isFakeIp(address)) && getConfig().security?.fakeIpDnsFallback !== false) {
+      try {
+        addresses = await lookupPublicHost(h);
+      } catch (error) {
+        throw new Error(`检测到代理 Fake-IP，公共 DNS 解析失败：${error?.message ?? error}`);
+      }
+    }
     for (const { address } of addresses) {
-      if (isPrivateIp(address)) throw new Error('域名解析到内网/本机地址，已阻止');
+      if (!net.isIP(address) || isPrivateIp(address)) throw new Error('域名解析到内网/本机地址，已阻止');
     }
   }
   return addresses[0].address;
@@ -137,7 +150,10 @@ async function resolveSafeHost(hostname, { allowPrivate = false } = {}) {
 export async function validateFetchUrl(raw, { allowPrivate = false } = {}) {
   let url;
   try {
-    url = new URL(String(raw ?? '').trim());
+    const text = String(raw ?? '').trim();
+    // 只接受完整的单个 Markdown 链接，不从任意文本中提取 URL。
+    const markdown = text.match(/^\[[^\]\r\n]*\]\((https?:\/\/[^\s]+)\)$/i);
+    url = new URL(markdown ? markdown[1] : text);
   } catch {
     throw new Error('URL 无效');
   }
@@ -169,14 +185,19 @@ function readBounded(res, maxBytes, asText) {
     res.on('data', (chunk) => {
       if (settled) return;
       total += chunk.length;
+      if (!asText && total > maxBytes) {
+        finish(reject, new Error('图片响应超过大小限制'));
+        res.destroy();
+        return;
+      }
       if (asText) text += decoder.write(chunk);
       else chunks.push(chunk);
       // 只用字节数判断是否超限。原实现还额外判断了 text.length >= maxBytes，
       // 但 text.length 是字符数而 maxBytes 是字节数（UTF-8 下中文 1 字符 = 3 字节），
       // 单位不一致，会让刚好读满的响应被误标成 truncated。
-      if (total >= maxBytes) {
-        try { res.destroy(); } catch { /* ignore */ }
+      if (asText && total >= maxBytes) {
         finish(resolve, asText ? sliceByCodePoints(text, maxBytes) : Buffer.concat(chunks).subarray(0, maxBytes));
+        try { res.destroy(); } catch { /* ignore */ }
       }
     });
     res.on('end', () => {
@@ -190,6 +211,7 @@ function readBounded(res, maxBytes, asText) {
       }
     });
     res.on('error', (err) => finish(reject, err));
+    res.on('aborted', () => finish(reject, new Error('响应体传输中断，请稍后重试')));
   });
 }
 
@@ -210,7 +232,8 @@ function requestOnce(url, ip, { asBinary = false, maxBytes = 50000 } = {}) {  re
       },
       servername: url.protocol === 'https:' ? url.hostname : undefined,
       rejectUnauthorized: url.protocol === 'https:',
-      timeout: 20000
+      timeout: 20000,
+      signal: AbortSignal.timeout(20000)
     }, (res) => {
       const statusCode = res.statusCode || 0;
       if ([301, 302, 303, 307, 308].includes(statusCode)) {
@@ -248,8 +271,7 @@ export async function safeFetch(urlString) {
 }
 
 /** 下载二进制（图片，≤maxBytes 字节），返回 { buffer, contentType }。 */
-export async function safeFetchBinary(urlString, maxBytes = 12 * 1024 * 1024) {
-  const allowPrivate = getConfig().security?.allowPrivateImageHosts === true;
+export async function safeFetchBinary(urlString, maxBytes = 12 * 1024 * 1024, { allowPrivate = getConfig().security?.allowPrivateImageHosts === true } = {}) {
   let { url, ip } = await validateFetchUrl(urlString, { allowPrivate });
   for (let i = 0; i <= MAX_REDIRECTS; i++) {
     const result = await requestOnce(url, ip, { asBinary: true, maxBytes });

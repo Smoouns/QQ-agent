@@ -49,7 +49,11 @@
   "scripts": {
     "start": "electron .",
     "server": "node src/server.js",
-    "test": "node test/selftest.mjs && node test/render-test.mjs && node test/scroll-test.mjs && node test/usage-e2e.mjs && node test/mcp-test.mjs && node test/memory-test.mjs && node test/context-test.mjs && node test/group-members-test.mjs && node test/permissions-test.mjs && node test/privacy-test.mjs && node test/computer-status-test.mjs && node test/response-rules-test.mjs",
+    "test": "node test/selftest.mjs && node test/render-test.mjs && node test/scroll-test.mjs && node test/usage-e2e.mjs && node test/mcp-test.mjs && node test/memory-test.mjs && node test/context-test.mjs && node test/group-members-test.mjs && node test/permissions-test.mjs && node test/privacy-test.mjs && node test/computer-status-test.mjs && node test/response-rules-test.mjs && node test/manual-reply-test.mjs && node test/search-test.mjs && node test/safe-fetch-test.mjs && node test/image-test.mjs",
+    "test:images": "node test/image-test.mjs",
+    "test:fetch": "node test/safe-fetch-test.mjs",
+    "test:search": "node test/search-test.mjs",
+    "test:manual": "node test/manual-reply-test.mjs",
     "test:response": "node test/response-rules-test.mjs",
     "test:computer": "node test/computer-status-test.mjs",
     "test:privacy": "node test/privacy-test.mjs",
@@ -66,6 +70,7 @@
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.30.0",
     "ajv": "^8.20.0",
+    "htmlparser2": "^10.1.0",
     "undici": "^6.28.0",
     "ws": "^8.18.0",
     "zod": "^4.6.2"

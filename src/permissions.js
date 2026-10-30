@@ -127,6 +127,7 @@ export class PermissionService {
     return p.role === 'public' && !p.confirm && (p.chats === undefined || p.chats.includes(chatKey));
   }
   check(ctx, def, args, { confirmed = false, prepare = false } = {}) {
+    ctx.assertRunAllowed?.();
     if (!object(args)) fail('工具参数必须是 JSON 对象');
     const p = this.#policy(def), grant = this.#grants.get(ctx);
     if (!['public', 'admin'].includes(p.role)) fail('工具已禁用');

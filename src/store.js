@@ -110,7 +110,7 @@ export class ChatStore {
   }
 
   /** 记录机器人自己发出的消息（已读）。 */
-  appendSelf(chatKey, { text, ts, mid = null }) {
+  appendSelf(chatKey, { text, ts, mid = null, media = [] }) {
     const st = this.#state(chatKey);
     const entry = {
       id: st.nextLocalId++,
@@ -122,7 +122,7 @@ export class ChatStore {
       self: true,
       read: true,
       reply: null,
-      media: []
+      media: Array.isArray(media) ? media : []
     };
     st.messages.push(entry);
     saveChat(st);

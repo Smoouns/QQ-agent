@@ -7,7 +7,9 @@ import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { getConfig, updateConfig, ROOT, DATA_DIR } from './config.js';
-import { customSearch } from './web-search.js';
+import { customSearch, webSearch } from './web-search.js';
+import { imageBudgetStatus } from './image-budget.js';
+import { normalizeImageConfig } from './image-config.js';
 import { OneBotClient, segmentsToText, extractMediaFromSegments, expandForwardNodes } from './onebot.js';
 import { ChatStore } from './store.js';
 import { MemoryStore } from './memory.js';
@@ -255,6 +257,7 @@ export function createApp({ log = console.log } = {}) {
 
   // ── 组件 ──
   const visionScan = { running: false };   // 模型图片输入能力扫描的运行状态
+  let searchTestRunning = false;
   const store = new ChatStore(cfg.store?.maxMessagesPerChat ?? 0);   // 0 = 不限
   const memory = new MemoryStore();
   const sessions = new SessionRegistry(cfg.store?.keepSessionFiles ?? 0);   // 0 = 不限
@@ -991,7 +994,7 @@ export function createApp({ log = console.log } = {}) {
         const field = String(url.searchParams.get('field') || '');
         // 自定义搜索服务的 Key 不走这里（它们存在 webSearch.providers 数组里，
         // 由 /api/search-providers 管理，且添加时是一次性输入，不提供明文回读）。
-        const allowed = ['deepseek', 'zhipu', 'bocha', 'baidu', 'metaso'];
+        const allowed = ['opencodex', 'deepseek', 'zhipu', 'bocha', 'baidu', 'metaso'];
         if (!allowed.includes(field)) {
           return json(res, 400, { error: `未知搜索服务：${field}` });
         }
@@ -1224,6 +1227,27 @@ export function createApp({ log = console.log } = {}) {
         }
       }
 
+      if (pathname === '/api/test/search' && method === 'POST') {
+        if (!keyEndpointAllowed(req)) return json(res, 403, { error: '仅允许控制台测试搜索' });
+        if (searchTestRunning) return json(res, 409, { error: '已有搜索测试正在运行' });
+        const body = await readBody(req);
+        const query = typeof body.query === 'string' ? body.query.trim() : '';
+        if (!query || query.length > 120) return json(res, 400, { error: '测试查询须为 1–120 字' });
+        searchTestRunning = true;
+        const controller = new AbortController(), startedAt = Date.now();
+        const onClose = () => { if (!res.writableEnded) controller.abort(); };
+        res.on('close', onClose);
+        try {
+          const result = await webSearch(query, { signal: controller.signal });
+          return json(res, 200, { ok: true, provider: cfgNow.webSearch?.provider || 'bing', result, latencyMs: Date.now() - startedAt });
+        } catch (error) {
+          if (!res.destroyed) return json(res, 200, { ok: false, error: String(error?.message ?? error), latencyMs: Date.now() - startedAt });
+        } finally {
+          searchTestRunning = false; res.off('close', onClose);
+        }
+        return;
+      }
+
       if (pathname === '/api/test/api' && method === 'POST') {
         const startedAt = Date.now();
         try {
@@ -1250,18 +1274,30 @@ export function createApp({ log = console.log } = {}) {
         const patch = await readBody(req);
         if ('permissions' in patch) return json(res, 400, { error: '请通过专用权限接口修改权限' });
         if ('mcp' in patch) return json(res, 400, { error: 'MCP 配置请通过工具页面保存' });
+        if ('imageGeneration' in patch) {
+          try {
+            const incoming = patch.imageGeneration;
+            normalizeImageConfig({ ...getConfig().imageGeneration, ...incoming,
+              chatDailyLimits: incoming?.chatDailyLimits?.__replace__ ?? incoming?.chatDailyLimits ?? getConfig().imageGeneration?.chatDailyLimits });
+          } catch (e) { return json(res, 400, { error: e.message }); }
+        }
         const next = updateConfig(patch);
         store.setMaxPerChat(next.store?.maxMessagesPerChat ?? 0);
         orchestrator.startProactiveLoop();
         if (!orchestrator.aborted) orchestrator.memoryPipeline.resume();
         initPriceFeed(next.api?.priceRemoteUrl || '');   // 远程价格表 URL 可能改了（内部幂等）
         emit('status', { configUpdated: true });
-        return json(res, 200, { ok: true, config: { ...next, mcp: { servers: (next.mcp?.servers || []).map(publicMcpServer) } } });
+        return json(res, 200, { ok: true, config: sanitizeConfig(next) });
       }
 
       if (pathname === '/api/version' && method === 'GET') {
         // 纯本地读取，无网络依赖：设置页"当前版本"展示用
         return json(res, 200, { version: localVersion() });
+      }
+
+      if (pathname === '/api/images/budget' && method === 'GET') {
+        try { return json(res, 200, imageBudgetStatus(url.searchParams.get('chatKey') || '')); }
+        catch (e) { return json(res, 400, { error: e.message }); }
       }
 
       if (pathname === '/api/models' && method === 'GET') {
@@ -1423,6 +1459,16 @@ export function createApp({ log = console.log } = {}) {
           return json(res, 200, { members });
         } catch (error) {
           return json(res, 502, { error: String(error?.message ?? error) });
+        }
+      }
+
+      const chatAgentReplyMatch = /^\/api\/chats\/(group|private)_([1-9]\d{0,14})\/agent-reply$/.exec(pathname);
+      if (chatAgentReplyMatch && method === 'POST') {
+        if (!keyEndpointAllowed(req)) return json(res, 403, { error: '请从本机控制台发起测试回复' });
+        try {
+          return json(res, 200, orchestrator.requestManualReply(`${chatAgentReplyMatch[1]}:${chatAgentReplyMatch[2]}`));
+        } catch (error) {
+          return json(res, error.status || 500, { error: String(error.message) });
         }
       }
 

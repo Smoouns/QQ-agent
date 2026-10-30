@@ -181,6 +181,9 @@ check('加载更多时 detail.innerHTML 未被整体重写',
 const wakeBtn = document.getElementById('chat-wake-btn');
 const wakeCount = (listeners.get(wakeBtn)?.click || []).length;
 check('唤醒按钮只绑 1 次点击', wakeCount <= 1, `实际 ${wakeCount}`);
+const agentReplyBtn = document.getElementById('chat-agent-reply-btn');
+check('测试 Agent 回复入口存在，滚动后只绑定一次', htmlAfterFirst.includes('测试 Agent 回复')
+  && (listeners.get(agentReplyBtn)?.click || []).length === 1);
 
 console.log('\n=== ④ 到底部后不再增长 ===');
 // 一直加载到底（每次先滚到底）
@@ -256,6 +259,30 @@ console.log('\n=== ⑥ 快速滚到底：被节流的尾部事件必须补触发
   const rowsAfter = (tbody.innerHTML.match(/<tr/g) || []).length;
   check('尾随调用补上了加载（900 → 1100）', rowsAfter === rowsBefore + 200,
     `${rowsBefore} -> ${rowsAfter}（没补上就是"滚得快滚不下去"那个 bug）`);
+}
+
+console.log('\n=== ⑦ 手动 Agent 回复按钮 ===');
+{
+  const oldFetch = sandbox.fetch;
+  const calls = [];
+  let release;
+  const held = new Promise((resolve) => { release = resolve; });
+  sandbox.fetch = async (url, options) => {
+    if (String(url).endsWith('/agent-reply')) { calls.push({ url, options }); await held; }
+    return { ok: true, json: async () => ({ ok: true }) };
+  };
+  const click = listeners.get(agentReplyBtn).click[0];
+  const task = click(); await click();
+  check('请求期间禁用按钮，重复点击只发一次 POST', agentReplyBtn.disabled === true && calls.length === 1
+    && calls[0].url.endsWith('/group_test/agent-reply') && calls[0].options.method === 'POST');
+  release(); await task;
+  check('成功后显示运行记录入口提示并恢复按钮', agentReplyBtn.disabled === false
+    && document.getElementById('chat-agent-reply-status').textContent.includes('已启动'));
+  sandbox.fetch = async () => ({ ok: false, status: 409, json: async () => ({ error: '此会话正在处理' }) });
+  await click();
+  check('失败原因展示在按钮附近并恢复按钮', agentReplyBtn.disabled === false
+    && document.getElementById('chat-agent-reply-status').textContent.includes('此会话正在处理'));
+  sandbox.fetch = oldFetch;
 }
 
 console.log('\n' + (fail ? 'FAILED ' + fail : 'ALL PASSED ' + pass));

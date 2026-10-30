@@ -3,6 +3,7 @@
 // 对外抓取网页正文一律走 safe-fetch（web_fetch 工具）。
 import { getConfig } from './config.js';
 import { safeFetch } from './safe-fetch.js';
+import { openCodexSearch } from './opencodex-search.js';
 
 /** 查询词清洗：去 CQ 码、控制字符、超长截断。 */
 export function sanitizeQuery(query) {
@@ -60,11 +61,12 @@ export async function bingSearch(query) {
 }
 
 /** 给工具用的统一入口：搜索 + 紧凑序列化。 */
-export async function webSearch(query) {
+export async function webSearch(query, { signal } = {}) {
   const clean = sanitizeQuery(query);
   if (!clean) throw new Error('查询词为空');
   const cfg = getConfig().webSearch ?? {};
   const provider = String(cfg.provider || 'bing').toLowerCase();
+  if (provider === 'opencodex') return openCodexSearch(clean, cfg.opencodex || {}, { signal, maxResults: cfg.maxResults });
   if (provider === 'deepseek') return deepSeekSearch(clean);
   if (provider === 'zhipu') return zhipuSearch(clean);
   if (provider === 'bocha') return bochaSearch(clean);

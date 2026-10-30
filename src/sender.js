@@ -6,6 +6,7 @@
 import { getConfig, DEFAULT_CONFIG } from './config.js';
 import { sleep, randInt, createSendChain, escapeCqText, formatClockTime } from './util.js';
 import { mdToPlain, splitForQQ } from './md-to-plain.js';
+import { loadImage } from './image-assets.js';
 
 // 限频回退值统一取自 DEFAULT_CONFIG，杜绝"代码默认 80 / 回退值 8 / UI 回退 8"三处打架。
 const DEFAULT_MAX_PER_MINUTE = DEFAULT_CONFIG.send.maxPerMinute;
@@ -115,6 +116,26 @@ export class SendQueue {
       console.warn(`[sender] 部分发送失败（${failed.length}/${parts.length}）：${detail}`);
     }
     return { sent, failed };
+  }
+
+  /** 发送本会话的图片资源。二进制不经过模型或工具日志。 */
+  sendImage(chatKey, imageId, options = {}) {
+    const [kind, id] = String(chatKey).split(':');
+    if (!['group', 'private'].includes(kind)) throw new Error('非法会话 key');
+    return this.#chain(chatKey)(async () => {
+      const image = loadImage(chatKey, imageId);
+      options.beforeSend?.();
+      this.#checkRate(chatKey);
+      // 同机协议端直接读取校验后的内部资源，避免 Base64 膨胀触发 SnowLuma 的 2 MiB HTTP 请求体上限。
+      const source = this.onebot.canReadLocalImageFiles && getConfig().snowluma?.imageTransport !== 'base64'
+        ? image.fileUrl : `base64://${image.buffer.toString('base64')}`;
+      const data = await this.onebot.sendImage(kind, id, source, options);
+      const ts = Date.now(), text = `[图片:${imageId}]`;
+      this.store.appendSelf(chatKey, { text, ts, mid: data?.message_id ?? null,
+        media: [{ kind: 'image', imageId, mime: image.mime }] });
+      this.onSent?.({ chatKey, text, messageId: data?.message_id ?? null, imageId });
+      return { message_id: data?.message_id ?? null };
+    });
   }
 
   /** 发送一个收藏表情（独立气泡）。 */

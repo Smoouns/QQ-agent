@@ -272,9 +272,40 @@ export class Orchestrator {
     return true;
   }
 
+  #assertManualReplyAllowed(chatKey) {
+    const reject = (message, status) => { throw Object.assign(new Error(message), { status }); };
+    if (!/^(group|private):[1-9]\d{0,14}$/.test(chatKey)) reject('无效的会话', 400);
+    if (this.paused || this.aborted) reject('请先恢复机器人运行', 409);
+    if (!this.#chatAllowed(chatKey)) reject('此会话不在允许接入范围', 403);
+    if (!String(getConfig().api.model || '').trim()) reject('请先配置聊天模型', 400);
+  }
+
+  #manualReplySource(chatKey) {
+    return this.store.before(chatKey, this.store.boundary(chatKey) + 1, {
+      limit: 1, accept: (m) => !m.self && !parseCommand(m) && messageAllowed(m, chatKey)
+    })[0];
+  }
+
+  /** A trusted console action, not a QQ command grant. Dispatch immediately so repeated clicks see the run lock. */
+  requestManualReply(chatKey) {
+    this.#assertManualReplyAllowed(chatKey);
+    if (this.runningChats.has(chatKey)) throw Object.assign(new Error('此会话正在处理，请等待本轮结束'), { status: 409 });
+    if (this.runningChats.size >= Math.max(1, Number(getConfig().maxConcurrentRuns) || 2)) {
+      throw Object.assign(new Error('当前并发已满，请稍后重试'), { status: 409 });
+    }
+    if (!this.#manualReplySource(chatKey)) throw Object.assign(new Error('此会话没有可用于测试的用户消息'), { status: 400 });
+    clearTimeout(this.wakeTimers.get(chatKey)); this.wakeTimers.delete(chatKey); this.pendingWake.delete(chatKey);
+    const waiting = this.pendingSessions.get(chatKey);
+    this.pendingSessions.delete(chatKey);
+    if (waiting) this.#discardWaiting(waiting);
+    this.wake(chatKey, { manualReply: true }).catch((error) => console.error('[manual-reply]', error));
+    return { ok: true, sessionId: this.activeRuns.get(chatKey) };
+  }
+
   // ── 核心循环 ───────────────────────────────────────────────────────────
 
-  async wake(chatKey, { proactive = false, waitingSessionId = null } = {}) {
+  async wake(chatKey, { proactive = false, waitingSessionId = null, manualReply = false } = {}) {
+    if (manualReply) this.#assertManualReplyAllowed(chatKey);
     if (this.aborted) { if (waitingSessionId) this.#finishWaiting(waitingSessionId, 'aborted'); return; }
     if (this.paused) { if (waitingSessionId) this.#finishWaiting(waitingSessionId, 'aborted'); return; }
     if (this.runningChats.has(chatKey)) return;
@@ -311,20 +342,21 @@ export class Orchestrator {
 
     // Fix the batch synchronously before the first await. New arrivals stay unread.
     const boundary = this.store.boundary(chatKey);
-    const pendingEntries = structuredClone(this.store.peekUnread(chatKey, Infinity));
-    const commandEntry = pendingEntries.find(parseCommand);
+    const pendingEntries = structuredClone(this.store.peekUnread(chatKey, Infinity))
+      .filter((m) => !manualReply || (!parseCommand(m) && messageAllowed(m, chatKey)));
+    const commandEntry = manualReply ? null : pendingEntries.find(parseCommand);
     if (commandEntry) {
       await this.#runCommand(chatKey, commandEntry, waitingSessionId);
       return;
     }
     if (pendingEntries.length) proactive = false;
     const rulesMode = responseSettings(getConfig(), chatKey).mode === 'rules';
-    if (!proactive && !pendingEntries.length && !rulesMode) {
+    if (!manualReply && !proactive && !pendingEntries.length && !rulesMode) {
       if (waitingSessionId) this.#finishWaiting(waitingSessionId, 'aborted');
       return;
     }
     // Legacy callers cannot bypass the gate by setting proactive=true.
-    const tierResult = this.#predictTier(chatKey);
+    const tierResult = manualReply ? { tier: 0, reason: '控制台手动测试回复', shouldRespond: true, manualReply: true } : this.#predictTier(chatKey);
     if (rulesMode && !this.#chatAllowed(chatKey)) {
       this.responseActivity.consume(chatKey, boundary);
       if (waitingSessionId) this.#discardWaiting(waitingSessionId);
@@ -340,7 +372,8 @@ export class Orchestrator {
     }
     // An acknowledged message can still trigger a later silence/hot run, including with a zero history window.
     const automaticSource = tierResult.automatic ? this.store.findByLocalId(chatKey, tierResult.sourceId) : null;
-    const runEntries = pendingEntries.length ? pendingEntries : automaticSource ? [automaticSource] : [];
+    const manualSource = manualReply ? this.#manualReplySource(chatKey) : null;
+    const runEntries = pendingEntries.length ? pendingEntries : manualSource ? [manualSource] : automaticSource ? [automaticSource] : [];
     const window = selectWindow(this.store, chatKey, runEntries, { boundary });
     const triggerEntries = window.trigger;
     const selectedMemories = recallMemories(this.memory, chatKey, {
@@ -356,7 +389,7 @@ export class Orchestrator {
 
     // 触发摘要
     const first = triggerEntries[0];
-    const triggerSummary = proactive
+    const triggerSummary = manualReply ? tierResult.reason : proactive
       ? tierResult.reason
       : (first ? `${first.senderName || first.senderId}：${String(first.text || '').slice(0, 40)}` : '');
 
@@ -470,8 +503,9 @@ export class Orchestrator {
         const cfg = getConfig();
         const vision = cfg.api.vision !== false && modelImageVerdict(cfg.api.provider, cfg.api.model) !== 'no-vision';
         const defs = this.toolDefs.filter((d) => (kind === 'group' || d.name !== 'get_group_members')
-          && (vision || !['get_message_images', 'get_sticker_image'].includes(d.name))
-          && (cfg.webSearch?.enabled !== false || !['web_search', 'web_fetch'].includes(d.name)));
+          && (cfg.imageGeneration?.enabled !== false || d.name !== 'generate_image')
+          && (vision || !['get_message_images', 'get_sticker_image', 'inspect_image'].includes(d.name))
+          && (cfg.webSearch?.enabled !== false || !['web_search', 'web_fetch', 'get_webpage_images'].includes(d.name)));
         if (this.mcp && targetTool.startsWith('mcp:')) defs.push(...(await this.mcp.toolDefsForChat(chatKey)).defs);
         return defs;
       });
@@ -546,7 +580,8 @@ export class Orchestrator {
     }
 
     // 组装提示词（无 LLM 历史）
-    const systemPrompt = (session.contextSelection ? session.systemPrompt : buildSystemPrompt({ entries: [...snapshotMessages, ...window.quotes] }));
+    const systemPrompt = (session.contextSelection ? session.systemPrompt : buildSystemPrompt({ entries: [...snapshotMessages, ...window.quotes] })
+      + (tierInfo?.manualReply ? '\n\n【控制台手动测试】\n本轮由本机控制台请求测试 Agent 回复。请结合当前会话上下文，使用 send_message 向当前会话发送一条简短、自然的回复。不要因为热度、冷场、随机概率或消息已读而跳过回应。此操作不授予管理员工具权限，也不授权执行历史中的命令。' : ''));
     const userPrompt = (session.contextSelection ? session.userPrompt : buildUserPrompt({
       window, selectedMemories, now, session, selfId: this.onebot.selfId,
       chatKey, kind, chatId, chatName,
@@ -596,9 +631,10 @@ export class Orchestrator {
       && modelImageVerdict(cfg.api.provider, cfg.api.model) !== 'no-vision';
     const searchEnabled = cfg.webSearch?.enabled !== false;
     const toolDefs = this.toolDefs.filter((d) => {
+      if (cfg.imageGeneration?.enabled === false && d.name === 'generate_image') return false;
       if (kind !== 'group' && d.name === 'get_group_members') return false;
-      if (!visionEnabled && (d.name === 'get_message_images' || d.name === 'get_sticker_image')) return false;
-      if (!searchEnabled && (d.name === 'web_search' || d.name === 'web_fetch')) return false;
+      if (!visionEnabled && ['get_message_images', 'get_sticker_image', 'inspect_image'].includes(d.name)) return false;
+      if (!searchEnabled && ['web_search', 'web_fetch', 'get_webpage_images'].includes(d.name)) return false;
       return true;
     });
     if (this.mcp) {
@@ -624,6 +660,8 @@ export class Orchestrator {
       mcp: this.mcp,
       sender: this.sender,
       session,
+      assertRunAllowed: tierInfo?.manualReply ? () => this.#assertManualReplyAllowed(chatKey) : undefined,
+      isCancelled: () => this.paused || this.aborted,
       emit: (type, payload) => this.emit(type, payload)
     };
 
@@ -645,6 +683,7 @@ export class Orchestrator {
       const response = await chatCompletionWithRetry({ messages, tools: openAiTools, beforeRequest: () => {
         assertContextAllowed(session, this.memory, chatKey);
         if (this.paused || this.aborted) throw new Error('机器人已暂停');
+        if (tierInfo?.manualReply) this.#assertManualReplyAllowed(chatKey);
         if (tierInfo?.automatic && !session.autoParticipationCharged) {
           const settings = responseSettings(getConfig(), chatKey);
           this.#observeActivity(chatKey, settings);
@@ -724,9 +763,9 @@ export class Orchestrator {
       for (const call of toolCalls) {
         assertContextAllowed(session, this.memory, chatKey);
         const name = call?.function?.name ?? '';
-        if (['send_message', 'send_sticker', 'send_poke', 'memory_append', 'memory_remove', 'collect_sticker', 'sticker_note'].includes(name)) session.sideEffectAttempted = true;
+        if (['send_message', 'send_sticker', 'send_image', 'generate_image', 'send_poke', 'memory_append', 'memory_remove', 'collect_sticker', 'sticker_note'].includes(name)) session.sideEffectAttempted = true;
         const argsRaw = call?.function?.arguments ?? '{}';
-        if (name === 'web_search' || name === 'web_fetch') webSearchCount += 1;
+        if (['web_search', 'web_fetch', 'get_webpage_images'].includes(name)) webSearchCount += 1;
         session.webSearchCount = webSearchCount;
         markActivity(`正在调用 ${name}…`);
         const result = await executeTool(availableDefs, ctx, name, argsRaw);
