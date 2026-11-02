@@ -2,12 +2,13 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { pathToFileURL } from 'node:url';
-import { DATA_DIR } from './config.js';
 import { assertImageChat } from './image-config.js';
 import { safeFetchBinary } from './safe-fetch.js';
+import { IMAGE_ASSET_DIR, IMAGE_ID_RE, IMAGE_STAGING_FORMAT, MAX_IMAGE_BYTES } from './image-asset-files.js';
+import { withImageStorageLock } from './image-storage-lock.js';
 
-export const MAX_IMAGE_BYTES = 12 * 1024 * 1024;
-const root = path.join(DATA_DIR, 'image-assets');
+export { MAX_IMAGE_BYTES };
+const root = IMAGE_ASSET_DIR;
 
 export function imageMime(buffer) {
   if (!Buffer.isBuffer(buffer) || buffer.length < 12 || buffer.length > MAX_IMAGE_BYTES) throw new Error('图片为空、过小或超过 12 MiB');
@@ -27,19 +28,50 @@ export function decodeImage(encoded) {
   return buffer;
 }
 
-export function saveImage(chatKey, buffer, source) {
+export function saveImage(chatKey, buffer, source, { referenceImageIds = [] } = {}) {
   assertImageChat(chatKey);
   const mime = imageMime(buffer), imageId = randomUUID();
-  const metadata = { imageId, chatKey, mime, bytes: buffer.length, source, createdAt: Date.now() };
-  fs.mkdirSync(root, { recursive: true });
-  fs.writeFileSync(path.join(root, `${imageId}.bin`), buffer, { flag: 'wx' });
-  fs.writeFileSync(path.join(root, `${imageId}.json`), JSON.stringify(metadata), { flag: 'wx' });
-  return metadata;
+  if (!Array.isArray(referenceImageIds) || referenceImageIds.length > 4 || new Set(referenceImageIds).size !== referenceImageIds.length) throw new Error('参考图 ID 无效');
+  for (const id of referenceImageIds) loadImage(chatKey, id);
+  const metadata = { imageId, chatKey, mime, bytes: buffer.length, source, createdAt: Date.now(),
+    ...(referenceImageIds.length ? { referenceImageIds: [...referenceImageIds] } : {}) };
+  return withImageStorageLock(() => {
+    fs.mkdirSync(root, { recursive: true });
+    if (!fs.lstatSync(root).isDirectory() || fs.lstatSync(root).isSymbolicLink()) throw new Error('图片资源目录不是常规目录');
+    const staging = path.join(root, `${imageId}.tmp`);
+    fs.mkdirSync(staging);
+    // A marker, not an age or a .tmp extension, establishes ownership. An
+    // interrupted write is left intact for explicit, reference-aware cleanup.
+    fs.writeFileSync(path.join(staging, 'manifest.json'), JSON.stringify({
+      format: IMAGE_STAGING_FORMAT, imageId, chatKey, createdAt: metadata.createdAt
+    }), { flag: 'wx' });
+    fs.writeFileSync(path.join(staging, 'image.bin'), buffer, { flag: 'wx' });
+    fs.writeFileSync(path.join(staging, 'image.json'), JSON.stringify(metadata), { flag: 'wx' });
+    // Cooperating writers hold the same lock. Check both destinations before
+    // atomic publication; do not replace an existing UUID even on collision.
+    for (const extension of ['bin', 'json']) {
+      try {
+        fs.lstatSync(path.join(root, `${imageId}.${extension}`));
+        throw new Error('图片 ID 已存在，拒绝覆盖');
+      } catch (error) { if (error.code !== 'ENOENT') throw error; }
+    }
+    // Publish metadata last. Readers never see a partial JSON file. Renames
+    // also work on filesystems without hard-link support.
+    fs.renameSync(path.join(staging, 'image.bin'), path.join(root, `${imageId}.bin`));
+    fs.renameSync(path.join(staging, 'image.json'), path.join(root, `${imageId}.json`));
+    // Once committed, a housekeeping failure must not hide the reusable ID
+    // from the caller (especially for a paid generation). Retain residue.
+    try {
+      fs.unlinkSync(path.join(staging, 'manifest.json'));
+      fs.rmdirSync(staging);
+    } catch { /* explicit maintenance can inspect the leftover staging dir */ }
+    return metadata;
+  }, { waitMs: 5000 });
 }
 
 export function loadImage(chatKey, imageId) {
   assertImageChat(chatKey);
-  if (typeof imageId !== 'string' || !/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(imageId)) throw new Error('图片 ID 无效');
+  if (typeof imageId !== 'string' || !IMAGE_ID_RE.test(imageId)) throw new Error('图片 ID 无效');
   let metadata;
   try { metadata = JSON.parse(fs.readFileSync(path.join(root, `${imageId}.json`), 'utf8')); }
   catch { throw new Error('图片不存在'); }

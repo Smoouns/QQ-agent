@@ -17,6 +17,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { DATA_DIR } from './config.js';
+import { withImageStorageLock } from './image-storage-lock.js';
 
 const MESSAGES_DIR = path.join(DATA_DIR, 'messages');
 
@@ -40,10 +41,12 @@ function loadChat(chatKey) {
 }
 
 function saveChat(state) {
-  fs.mkdirSync(MESSAGES_DIR, { recursive: true });
-  const tmp = `${chatFile(state.chatKey)}.${process.pid}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(state, null, 1), 'utf8');
-  fs.renameSync(tmp, chatFile(state.chatKey));
+  withImageStorageLock(() => {
+    fs.mkdirSync(MESSAGES_DIR, { recursive: true });
+    const tmp = `${chatFile(state.chatKey)}.${process.pid}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(state, null, 1), 'utf8');
+    fs.renameSync(tmp, chatFile(state.chatKey));
+  }, { waitMs: 5000 });
 }
 
 export class ChatStore {

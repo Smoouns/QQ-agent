@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { DATA_DIR } from './config.js';
+import { withImageStorageLock } from './image-storage-lock.js';
 
 const SESSIONS_DIR = path.join(DATA_DIR, 'sessions');
 
@@ -152,12 +153,14 @@ export class SessionRegistry {
     // 清理超出保留数的旧文件
     try {
       if (this.keepFiles > 0) {
-        const files = fs.readdirSync(SESSIONS_DIR).filter((f) => f.endsWith('.json')).sort();
-        if (files.length > this.keepFiles) {
-          for (const f of files.slice(0, files.length - this.keepFiles)) {
-            try { fs.unlinkSync(path.join(SESSIONS_DIR, f)); } catch { /* ignore */ }
+        withImageStorageLock(() => {
+          const files = fs.readdirSync(SESSIONS_DIR).filter((f) => f.endsWith('.json')).sort();
+          if (files.length > this.keepFiles) {
+            for (const f of files.slice(0, files.length - this.keepFiles)) {
+              try { fs.unlinkSync(path.join(SESSIONS_DIR, f)); } catch { /* ignore */ }
+            }
           }
-        }
+        }, { waitMs: 5000 });
       }
     } catch { /* ignore */ }
     return s;
@@ -183,8 +186,10 @@ export class SessionRegistry {
     const before = this.index.length;
     this.index = this.index.filter((e) => e.id !== id);
     try {
-      const f = path.join(SESSIONS_DIR, `${id}.json`);
-      if (fs.existsSync(f)) fs.unlinkSync(f);
+      withImageStorageLock(() => {
+        const f = path.join(SESSIONS_DIR, `${id}.json`);
+        if (fs.existsSync(f)) fs.unlinkSync(f);
+      }, { waitMs: 5000 });
     } catch { /* ignore */ }
     return this.index.length < before;
   }
@@ -265,10 +270,12 @@ export class SessionRegistry {
 
   #persist(s) {
     try {
-      fs.mkdirSync(SESSIONS_DIR, { recursive: true });
-      const tmp = `${sessionFile(s.id)}.${process.pid}.tmp`;
-      fs.writeFileSync(tmp, JSON.stringify(s, null, 1), 'utf8');
-      fs.renameSync(tmp, sessionFile(s.id));
+      withImageStorageLock(() => {
+        fs.mkdirSync(SESSIONS_DIR, { recursive: true });
+        const tmp = `${sessionFile(s.id)}.${process.pid}.tmp`;
+        fs.writeFileSync(tmp, JSON.stringify(s, null, 1), 'utf8');
+        fs.renameSync(tmp, sessionFile(s.id));
+      }, { waitMs: 5000 });
       if (s.status !== 'running' && s.status !== 'waiting') this.#bumpTodayUsage(s);
     } catch (error) {
       console.error('[sessions] 持久化失败:', error?.message ?? error);
