@@ -1,6 +1,7 @@
 // Timing and message counts only. No text classification or model calls.
 export const DEFAULT_RESPONSE_RULES = {
-  groupMode: 'rules', hotEnabled: true, silenceEnabled: true,
+  groupMode: 'rules', privateMode: 'all', privateQuietMs: 2000, privateMaxWaitMs: 15000,
+  hotEnabled: true, silenceEnabled: true,
   windowMs: 60000, minMessages: 6, minSenders: 2, singleMessages: 5, fallbackMessages: 20,
   quietMs: 2000, maxWaitMs: 15000, silenceMs: 120000,
   cooldownMs: 20000, maxPerMinute: 2, chats: {}
@@ -12,10 +13,11 @@ export const RULE_LIMITS = {
   cooldownMs: [0, 300000], maxPerMinute: [1, 20]
 };
 const modes = ['rules', 'direct', 'all', 'legacy'];
+export const PRIVATE_BATCH_LIMITS = { privateQuietMs: [0, 30000], privateMaxWaitMs: [1000, 60000] };
 function fields(value = {}, partial = false) {
   const result = partial ? {} : { ...DEFAULT_RESPONSE_RULES };
   for (const key of ['hotEnabled', 'silenceEnabled']) if (typeof value[key] === 'boolean') result[key] = value[key];
-  for (const [key, [min, max]] of Object.entries(RULE_LIMITS)) {
+  for (const [key, [min, max]] of Object.entries({ ...RULE_LIMITS, ...PRIVATE_BATCH_LIMITS })) {
     if (value[key] !== undefined && value[key] !== null && Number.isFinite(Number(value[key]))) {
       result[key] = Math.min(max, Math.max(min, Math.round(Number(value[key]))));
     }
@@ -26,13 +28,14 @@ export function normalizeResponseRules(value = {}) {
   if (!value || typeof value !== 'object') value = {};
   const result = fields(value);
   result.groupMode = modes.includes(value.groupMode) ? value.groupMode : 'rules';
+  result.privateMode = modes.includes(value.privateMode) && value.privateMode !== 'rules' ? value.privateMode : 'all';
   result.chats = {};
   for (const [key, entry] of Object.entries(value.chats || {})) {
     if (!/^(group|private):[1-9]\d{0,14}$/.test(key) || !entry || typeof entry !== 'object') continue;
     const c = fields(entry, true);
     if (modes.includes(entry.mode)) c.mode = entry.mode;
     // Timing-based automatic participation is always group-only.
-    if (key.startsWith('private:') && c.mode === 'rules') c.mode = 'legacy';
+    if (key.startsWith('private:') && c.mode === 'rules') delete c.mode;
     if (entry.sliderPos != null && Number.isFinite(Number(entry.sliderPos))) c.sliderPos = Math.max(0, Math.min(100, Number(entry.sliderPos)));
     result.chats[key] = c;
   }
@@ -42,7 +45,7 @@ export function responseSettings(config, chatKey) {
   const rules = normalizeResponseRules(config.responseRules);
   const c = rules.chats[chatKey] || {};
   const { chats, ...defaults } = rules;
-  return { ...defaults, ...c, mode: c.mode || (chatKey.startsWith('group:') ? rules.groupMode : 'legacy') };
+  return { ...defaults, ...c, mode: c.mode || (chatKey.startsWith('group:') ? rules.groupMode : rules.privateMode) };
 }
 
 export class ResponseActivity {

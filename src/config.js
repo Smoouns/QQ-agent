@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { PERSONAS } from './personas.js';
 import { sliderToTier } from './tier-slider.js';   // 零依赖模块，避免循环依赖
 import { DEFAULT_RESPONSE_RULES, normalizeResponseRules } from './response-rules.js';
+import { DEFAULT_RUN_LIMITS, normalizeRunLimits } from './run-budget.js';
 import { DEFAULT_IMAGE_GENERATION, normalizeImageConfig } from './image-config.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -14,6 +15,7 @@ export const DATA_DIR = process.env.QQ_AGENT_DATA_DIR || path.join(ROOT, 'data')
 export const CONFIG_FILE = path.join(DATA_DIR, 'config.json');
 
 export const DEFAULT_CONFIG = {
+  runLimits: structuredClone(DEFAULT_RUN_LIMITS),
   imageGeneration: DEFAULT_IMAGE_GENERATION,
   permissions: { adminQQs: [], adminStyle: '', tools: {}, commands: {} },
   // OpenAI 兼容 API（必填才能跑）
@@ -26,7 +28,7 @@ export const DEFAULT_CONFIG = {
     provider: '',                           // 当前模型所属提供商（多提供商目录的选中项）
     vision: true,                           // 模型是否支持图片输入（关掉则移除看图工具）
     temperature: 0.8,
-    maxRounds: 12,                          // 单次运行的最多工具轮数
+    maxRounds: 12,                          // 常规模型调用预算；另有有限图片交付与一次文字收尾
     timeoutMs: 180000,
     // 成本核算（仅本地估算展示，不参与任何请求）
     priceInputPerM: 0,      // 输入单价（元 / 百万 token）—— 兜底默认值
@@ -182,7 +184,7 @@ export const DEFAULT_CONFIG = {
     //   - 存档已移除自动裁剪路径
     // 注意：单群文件会随时间增长，磁盘占用请自行留意。
     maxMessagesPerChat: 0, // 旧配置兼容字段，存档不再自动裁剪
-    historyCount: 80,           // 独立历史窗口；不含本次新消息，不删除存档
+    historyCount: 80,           // 历史基础条数；增长到 1.5 倍后分块裁回，不含本次新消息，不删除存档
     chatHistoryCounts: {},     // 可选会话覆盖，如 { 'group:123': 100 }
     // ── 响应档位（决定何时唤醒）──
     // 档位是"累积生效"的：选 4 档时 1/2/3 档也都生效，按 4→3→2→1 顺序检查，
@@ -276,6 +278,7 @@ export function updateConfig(patch) {
   candidate.imageGeneration = normalizeImageConfig(candidate.imageGeneration);
   currentConfig = candidate;
   currentConfig.responseRules = normalizeResponseRules(currentConfig.responseRules);
+  currentConfig.runLimits = normalizeRunLimits(currentConfig.runLimits);
 
   // ── 响应档位：以滑条位置为唯一真相，派生 tier 与随机概率 ──
   // 前端只负责上报滑条位置（contextSliderPos），档位和概率一律由这里换算。

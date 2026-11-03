@@ -1,3 +1,4 @@
+import { searchUsageCalls } from './search-usage.js';
 // 总装：OneBot 事件接入 → 存储 → 编排器；HTTP API + SSE 给 UI。
 // Electron 主进程与 headless 服务器都从这里启动。
 import http from 'node:http';
@@ -19,7 +20,7 @@ import { SessionRegistry } from './sessions.js';
 import { Orchestrator } from './orchestrator.js';
 import { directCommandText, normalizePermissions } from './permissions.js';
 import { McpManager, publicMcpServer } from './mcp.js';
-import { listModels, chatCompletion, resolveApiKey, estimateCost, cacheHitRate } from './llm.js';
+import { listModels, chatCompletion, resolveApiKey, estimateCost, cacheHitRate, addUsage, emptyUsage, cacheCoverage, CACHE_COUNTERS } from './llm.js';
 import { resolveOfficialPrice, listOfficialPrices, isPeakHour, priceAt, resolveModelPrice, modelLabel, splitModelLabel, UNKNOWN_VENDOR } from './model-prices.js';
 import { initPriceFeed, refreshPriceFeed, priceFeedStatus } from './price-feed.js';
 import { currentProviders, setProviderKey, testAllProviders, testOneProvider, testModelChat, fetchModelsFrom, upsertProvider, addModelsToProvider, removeModelFromProvider } from './providers.js';
@@ -243,6 +244,8 @@ export function createApp({ log = console.log } = {}) {
             // 用户只能手动刷新才看得到最终发言 —— 这就是"详情更新不及时"。
             sent: s.sent ?? [],
             finishReason: s.finishReason ?? null,
+            terminationReason: s.terminationReason ?? null, budget: s.budget ?? null, finalization: s.finalization ?? null,
+            searchUsageCalls: s.searchUsageCalls ?? null, toolCounts: s.toolCounts ?? null,
             error: s.error ?? null,
             endedAt: s.endedAt ?? null
           })}\n\n`;
@@ -1738,6 +1741,8 @@ function collectUsageRows({ range }) {
       && (Date.now() - usageRowsCache.at) < USAGE_CACHE_TTL_MS) {
     return {
       rows: usageRowsCache.rows.slice(),
+      searchRows: (usageRowsCache.searchRows || []).slice(),
+      legacySearchSessions: usageRowsCache.legacySearchSessions || 0,
       win: win || usageRowsCache.win,
       searchCount: usageRowsCache.searchCount || 0,
       toolCounts: { ...(usageRowsCache.toolCounts || {}) }
@@ -1746,9 +1751,10 @@ function collectUsageRows({ range }) {
 
   const dir = path.join(DATA_DIR, 'sessions');
   let files = [];
-  try { files = fs.readdirSync(dir).filter((f) => f.endsWith('.json')); } catch { return { rows: [], win, searchCount: 0, toolCounts: {} }; }
+  try { files = fs.readdirSync(dir).filter((f) => f.endsWith('.json')); } catch { return { rows: [], searchRows: [], legacySearchSessions: 0, win, searchCount: 0, toolCounts: {} }; }
 
-  const rows = [];
+  const rows = [], searchRows = [];
+  let legacySearchSessions = 0;
   // 会话级计数：搜索次数、各工具的调用次数。
   // 与 rows 在同一个循环里统计 —— 不额外多读一次文件。
   // 注意这些是"次数"不是"成本"：搜索通常是资源包或免费的，
@@ -1764,27 +1770,38 @@ function collectUsageRows({ range }) {
 
     // 这个会话是否落在时间窗口内（工具/搜索计数按会话归属，没有独立时间戳）
     if (started >= win.start && started <= win.end) {
-      searchCount += Number(s.webSearchCount) || 0;
+      if (!Array.isArray(s.searchUsageCalls) && s.webSearchCount > 0) legacySearchSessions++;
+      searchCount += (s.messages || []).filter(m => m.toolCall?.name === 'web_search' && !m.toolCall.blocked).length;
       for (const m of (s.messages || [])) {
         const name = m && m.toolCall && m.toolCall.name;
-        if (name) toolCounts[String(name)] = (toolCounts[String(name)] || 0) + 1;
+        if (name && !m.toolCall.blocked) toolCounts[String(name)] = (toolCounts[String(name)] || 0) + 1;
       }
     }
 
+    for (const call of searchUsageCalls(s)) {
+      const at = call.at || started;
+      if (at < win.start || at > win.end) continue;
+      const row = { ...call.usage, at, model: call.model || '(未知)', vendor: call.provider || '(未知)',
+        chatKey: s.chatKey, sessionId: s.id, exact: true, usageReported: call.usageReported };
+      row.modelKey = modelLabel(row.vendor, row.model); searchRows.push(row);
+    }
     // 逐次调用展开：每条 message.raw 有独立的 usage / created / model
     const calls = [];
+    let callIndex = 0;
     for (const m of (s.messages || [])) {
       const raw = m?.raw;
-      if (!raw || typeof raw !== 'object') continue;
+      if (!raw || typeof raw !== 'object' || m.role !== 'assistant') continue;
+      const phase = m.requestPhase === 'finalization' ? 'finalization' : callIndex === 0 ? 'first' : 'continuation';
+      callIndex++;
       const ru = raw.usage || {};
       const rp = Number(ru.prompt_tokens) || 0;
       const rc = Number(ru.completion_tokens) || 0;
-      if (!rp && !rc) continue;
       const at = Number(raw.created) ? Number(raw.created) * 1000 : started;
       calls.push({
         promptTokens: rp,
         completionTokens: rc,
-        cachedTokens: Number(ru.prompt_tokens_details?.cached_tokens) || 0,
+        ...addUsage(emptyUsage(), ru),
+        phase,
         at,
         model: String(raw.model || s.model || '') || '(未知)'
       });
@@ -1805,6 +1822,9 @@ function collectUsageRows({ range }) {
         promptTokens: p,
         completionTokens: c,
         cachedTokens: Number(u.cachedTokens) || 0,
+        ...cacheCoverage(u),
+        cacheUnreportedCalls: u.cacheUnreportedCalls ?? (u.cacheReportedCalls == null ? Math.max(1, Number(u.calls) || 0) : 0),
+        phase: 'unknown',
         at: started,
         model: String(s.model || '') || '(未知)',
         chatKey: String(s.chatKey || '(未知)'),
@@ -1826,10 +1846,12 @@ function collectUsageRows({ range }) {
   usageRowsCache.key = sig;
   usageRowsCache.at = Date.now();
   usageRowsCache.rows = rows.slice();
+  usageRowsCache.searchRows = searchRows.slice();
+  usageRowsCache.legacySearchSessions = legacySearchSessions;
   usageRowsCache.win = win;
   usageRowsCache.searchCount = searchCount;
   usageRowsCache.toolCounts = { ...toolCounts };
-  return { rows, win, searchCount, toolCounts };
+  return { rows, searchRows, legacySearchSessions, win, searchCount, toolCounts };
 }
 
 /** 用配置解析价格（成本只与实际调用的模型有关，与当前选中模型无关）。 */
@@ -1857,7 +1879,9 @@ function costOfRows(rows) {
   const cfg = getConfig();
   let cost = 0, peakCost = 0, offPeakCost = 0, peakTokens = 0, offPeakTokens = 0;
   let promptTokens = 0, completionTokens = 0, cachedTokens = 0, exactCalls = 0, hasPeakModel = false;
+  const coverage = cacheCoverage(null);
   for (const r of rows) {
+    for (const key of CACHE_COUNTERS) coverage[key] += Number(r[key]) || 0;
     const p = priceOf(r.model, r.vendor);
     if (p.peak) hasPeakModel = true;
     const tier = p.peak ? priceAt({ in: p.in, out: p.out, cached: p.cached, peak: p.peak }, r.at) : p;
@@ -1878,7 +1902,8 @@ function costOfRows(rows) {
     cost, peakCost, offPeakCost, peakTokens, offPeakTokens,
     promptTokens, completionTokens, cachedTokens,
     totalTokens: promptTokens + completionTokens,
-    cacheHitRate: promptTokens ? Math.min(1, cachedTokens / promptTokens) : 0,
+    ...coverage,
+    cacheHitRate: cacheHitRate(coverage),
     peakRatio: (peakTokens + offPeakTokens) ? peakTokens / (peakTokens + offPeakTokens) : 0,
     exactCalls, hasPeakModel, runs: rows.length
   };
@@ -1900,7 +1925,7 @@ function groupBy(rows, field, limit = 0) {
 
 /** 主统计：按天 / 按会话 / 按模型三个维度。 */
 function buildUsageStats({ range = '7' } = {}) {
-  const { rows, win, searchCount, toolCounts } = collectUsageRows({ range });
+  const { rows, searchRows, legacySearchSessions, win, searchCount, toolCounts } = collectUsageRows({ range });
   const totals = costOfRows(rows);
   // 单日/24小时场景下"按天"没有意义（只有一行），由前端决定是否隐藏
   const days = win.mode === 'days' ? groupBy(rows, 'dayKey').map((x) => ({ day: x.key, ...x })) : [];
@@ -1921,7 +1946,11 @@ function buildUsageStats({ range = '7' } = {}) {
     rangeLabel: win.label,
     mode: win.mode,
     totals,
-    // 次数类统计：只看数量，不参与成本计算
+    phases: Object.fromEntries(['first', 'continuation', 'finalization', 'unknown'].map((phase) => [phase, costOfRows(rows.filter((r) => r.phase === phase))])),
+    searchUsage: { ...costOfRows(searchRows), totalTokens: searchRows.reduce((sum, r) => sum + (r.totalTokens || 0), 0),
+      unreportedCalls: searchRows.filter(r => !r.usageReported).length, legacySearchSessions,
+      models: groupBy(searchRows, 'modelKey') },
+    // 搜索服务调用次数与搜索子模型 token 单独统计，不混入聊天模型成本。
     searchCount: searchCount || 0,
     toolCounts: toolCounts || {},
     days: byDay,
@@ -1958,6 +1987,7 @@ function buildUsageBreakdown({ range = '7', dim = '', key = '', by = '' } = {}) 
       cachedTokens: g.cachedTokens,
       totalTokens: g.totalTokens,
       cacheHitRate: g.cacheHitRate,
+      ...cacheCoverage(g),
       runs: g.runs,
       exactCalls: g.exactCalls
     }))

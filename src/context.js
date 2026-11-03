@@ -24,10 +24,26 @@ export function historyCount(chatKey) {
   return Number.isFinite(n) ? Math.max(0, Math.min(500, Math.floor(n))) : 80;
 }
 
-export function selectWindow(store, chatKey, triggerEntries, { boundary = store.boundary(chatKey), limit = historyCount(chatKey) } = {}) {
+// Anchors are scoped to the live store. Restart/config/privacy changes start a new window;
+// the archive is never trimmed. Retries reuse the already selected snapshot.
+const windowAnchors = new WeakMap();
+export function selectWindow(store, chatKey, triggerEntries, { boundary = store.boundary(chatKey), limit = historyCount(chatKey), trackWindow = true } = {}) {
   const trigger = structuredClone(triggerEntries.filter((m) => m.id <= boundary && messageAllowed(m, chatKey)));
   const before = trigger.length ? Math.min(...trigger.map((m) => m.id)) : boundary + 1;
-  const history = store.before(chatKey, before, { limit, accept: (m) => messageAllowed(m, chatKey) });
+  const blocklist = JSON.stringify([...blockedIds(chatKey)].sort());
+  const maxHistory = Math.ceil(limit * 1.5);
+  if (!windowAnchors.has(store)) windowAnchors.set(store, new Map());
+  const anchors = windowAnchors.get(store), previous = anchors.get(chatKey);
+  let history = store.before(chatKey, before, { limit, accept: (m) => messageAllowed(m, chatKey) });
+  let rolledOver = false;
+  if (limit > 0 && previous?.limit === limit && previous.blocklist === blocklist && boundary >= previous.boundary && before >= previous.before) {
+    // Request at most cap + 1 results to detect overflow.
+    const retained = store.before(chatKey, before, { limit: maxHistory + 1,
+      accept: (m) => m.id >= previous.start && messageAllowed(m, chatKey) });
+    rolledOver = retained.length > maxHistory;
+    if (!rolledOver) history = retained;
+  }
+  if (trackWindow) anchors.set(chatKey, { limit, blocklist, boundary, before, start: history[0]?.id ?? before });
   const triggerIds = new Set(trigger.map((m) => m.id));
   // The previous run may have spoken between arrivals in this unread batch.
   const interleaved = store.before(chatKey, boundary + 1, { limit: Infinity,
@@ -42,7 +58,7 @@ export function selectWindow(store, chatKey, triggerEntries, { boundary = store.
     }
   }
   quotes.sort((a, b) => a.id - b.id);
-  return { boundary, createdAt: Date.now(), limit, trigger, history, interleaved, quotes, blocklist: JSON.stringify([...blockedIds(chatKey)].sort()), beforeLocalId: history[0]?.id ?? before };
+  return { boundary, createdAt: Date.now(), limit, maxHistory, rolledOver, trigger, history, interleaved, quotes, blocklist, beforeLocalId: history[0]?.id ?? before };
 }
 
 const stop = new Set(['什么', '怎么', '这个', '那个', '我们', '你们', '他们', '一下', '一下子', '可以', '是不是', '有没有', '记得', '之前', '以前', '原来', '当时', '后来']);

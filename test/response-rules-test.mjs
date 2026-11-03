@@ -13,9 +13,14 @@ let now = Date.now(), checks = 0;
 const defaults = { ...DEFAULT_RESPONSE_RULES, mode: 'rules' };
 const entry = (id, senderId = '1', extra = {}) => ({ id, senderId, ts: now, receivedAt: now, allowed: true, ...extra });
 async function check(name, fn) { await fn(); console.log(`✓ ${++checks}. ${name}`); }
-await check('默认群聊规则、私聊旧档位；会话覆盖、数值边界和删除后继承默认', () => {
+await check('默认群聊规则、私聊每批回应；会话覆盖、数值边界和删除后继承默认', () => {
   assert.equal(responseSettings({}, 'group:1').mode, 'rules');
-  assert.equal(responseSettings({}, 'private:1').mode, 'legacy');
+  assert.equal(responseSettings({}, 'private:1').mode, 'all');
+  assert.equal(responseSettings({ responseRules: { groupMode: 'direct', privateMode: 'all' } }, 'private:1').mode, 'all');
+  assert.equal(responseSettings({ responseRules: { groupMode: 'rules', privateMode: 'legacy' } }, 'private:1').mode, 'legacy');
+  assert.equal(normalizeResponseRules({ privateMode: 'rules' }).privateMode, 'all');
+  assert.equal(normalizeResponseRules({ privateQuietMs: 0 }).privateQuietMs, 0);
+  assert.equal(normalizeResponseRules({ privateMaxWaitMs: 999999 }).privateMaxWaitMs, 60000);
   assert.equal(responseSettings({}, 'group:1').maxPerMinute, 2);
   assert.equal(responseSettings({}, 'group:1').windowMs, 60000);
   assert.equal(responseSettings({}, 'group:1').fallbackMessages, 20);
@@ -23,7 +28,7 @@ await check('默认群聊规则、私聊旧档位；会话覆盖、数值边界�
     'private:2': { mode: 'rules' }, 'private:3': { mode: 'all' }, bad: { mode: 'all' } } });
   assert.equal(responseRules.maxPerMinute, 1); assert.ok(!responseRules.chats.bad);
   assert.equal(responseSettings({ responseRules }, 'group:1').maxPerMinute, 4);
-  assert.equal(responseSettings({ responseRules }, 'private:2').mode, 'legacy');
+  assert.equal(responseSettings({ responseRules }, 'private:2').mode, 'all');
   assert.equal(responseSettings({ responseRules }, 'private:3').mode, 'all');
   setRuntimeConfig(structuredClone(DEFAULT_CONFIG));
   updateConfig({ responseRules });
@@ -188,10 +193,11 @@ try {
     append(key, '接着问', { reply: { senderId: '999', mid: '8888' } }); await orch.wake(key);
     assert.equal(calls, before + 4); assert.equal(orch.responseActivity.state(key).calls.length, 2);
   });
-  await check('每群参数覆盖与私聊默认旧档位，配置热修改不会补发旧候选', async () => {
+  await check('每群参数覆盖与私聊默认每批回应，配置热修改不会补发旧候选', async () => {
     cfg.responseRules.chats['group:12'] = { mode: 'direct' };
     append('group:12'); now += 120000; const before = calls;
     await orch.wake('group:12'); assert.equal(calls, before);
+    cfg.store.contextTier = 1; // Private default must not inherit the group legacy slider.
     append('private:123'); await orch.wake('private:123'); assert.equal(calls, before + 1);
     cfg.responseRules.chats['private:123'] = { mode: 'direct' };
     append('private:123'); await orch.wake('private:123'); assert.equal(calls, before + 1);

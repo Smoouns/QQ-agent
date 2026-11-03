@@ -8,12 +8,33 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import http from 'node:http';
 import { createApp } from '../src/app.js';
+import { DATA_DIR } from '../src/config.js';
+import { addUsage, emptyUsage } from '../src/llm.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..');
 
 let pass = 0, fail = 0;
 const check = (n, c, e = '') => { if (c) { pass++; console.log('  OK   ' + n); } else { fail++; console.log('  FAIL ' + n + (e ? ' -> ' + e : '')); } };
+
+// Isolated saved responses exercise real aggregation, including old proxies that
+// omit the cached-token field. No actual model requests are made.
+const usageDir = path.join(DATA_DIR, 'sessions');
+fs.mkdirSync(usageDir, { recursive: true });
+const fixtures = [
+  ['unreported', [{ prompt_tokens: 1000 }, { prompt_tokens: 1000 }]],
+  ['explicit-zero', [{ prompt_tokens: 100, prompt_tokens_details: { cached_tokens: 0 } }]],
+  ['reported-hit', [{ prompt_tokens: 100, prompt_cache_hit_tokens: 50 }, { prompt_tokens: 200, prompt_tokens_details: { cached_tokens: 150 } }]],
+  ['legacy', null]
+];
+for (const [model, usages] of fixtures) {
+  fs.writeFileSync(path.join(usageDir, model + '.json'), JSON.stringify({
+    id: model, startedAt: Date.now(), chatKey: model === 'unreported' ? 'private:1' : 'group:1', model, vendor: 'test',
+    messages: usages?.map((usage) => ({ role: 'assistant', raw: { model, usage } })) || [],
+    usage: { promptTokens: 300, completionTokens: 0, cachedTokens: 0, calls: 2 },
+    searchUsageCalls: model === 'reported-hit' ? [{ at: Date.now(), provider: 'opencodex', model: 'search-model', usageReported: true, usage: { ...addUsage(emptyUsage(), { input_tokens: 1234, output_tokens: 56, input_tokens_details: { cached_tokens: 1000 } }), calls: 1 } }, { at: Date.now(), provider: 'opencodex', model: 'search-model', usageReported: false, usage: { ...emptyUsage(), calls: 1 } }] : []
+  }));
+}
 
 // ── 起真服务 ──
 const app = createApp({ log: () => {} });
@@ -148,6 +169,17 @@ check('成本已填（¥ 开头）', cost.startsWith('¥'), cost);
 check('调用次数已填（数字）', /^\d+$/.test(runs), runs);
 check('搜索次数已填（数字）', /^[\d,]+$/.test(search), search);
 check('输入 token 已填', prompt.length > 0, prompt);
+check('搜索子模型输入输出独立核算，不混入聊天总量', freshStats.searchUsage.promptTokens === 1234 && freshStats.searchUsage.completionTokens === 56 && freshStats.searchUsage.totalTokens === 1290 && freshStats.searchUsage.unreportedCalls === 1 && freshStats.searchUsage.models[0].key.includes('search-model') && f('search-usage').includes('独立统计'));
+check('混合缓存统计只用已报告输入作分母', freshStats.totals.cacheHitRate === 0.5 && freshStats.totals.cacheReportedPromptTokens === 400 && freshStats.totals.promptTokens === 2700);
+check('旧数据和缺失字段计为未报告', freshStats.totals.cacheUnreportedCalls === 4 && freshStats.models.find((m) => m.model === 'unreported')?.cacheHitRate === null && freshStats.models.find((m) => m.model === 'legacy')?.cacheHitRate === null);
+check('接口明确报告零命中仍显示为零', freshStats.models.find((m) => m.model === 'explicit-zero')?.cacheHitRate === 0);
+check('首次请求与工具续轮分开统计', freshStats.phases.first.cacheHitRate === 0.25 && freshStats.phases.continuation.cacheHitRate === 0.75 && freshStats.phases.unknown.runs === 1);
+check('页面展示部分统计和轮次拆分', f('rate').includes('部分') && f('rate-phases').includes('首次请求：25.0%') && f('rate-phases').includes('工具续轮：75.0%'));
+const unknownStats = { totals: { cacheHitRate: null }, phases: {} };
+ctx.updateUsagePage(unknownStats, freshSt, priceData || {});
+check('缺失缓存数据展示未报告而非零', f('rate') === '未报告' && f('rate-sub').includes('不能判定为 0%'));
+ctx.updateUsagePage(freshStats, freshSt, priceData || {});
+
 
 // ── 各 range 都试 ──
 console.log('\n=== 各时间范围 ===');

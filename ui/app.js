@@ -376,9 +376,9 @@ async function refreshStatus() {
     const c = s.cost;
     const costTxt = c && c.cost > 0 ? ` · ¥${c.cost.toFixed(3)}` : '';
     const rate = s.cacheHitRate;
-    const rateTxt = rate > 0 ? ` · 缓存 ${Math.round(rate * 100)}%` : '';
+    const rateTxt = u.promptTokens > 0 ? ` · 缓存 ${fmtCacheRate({ ...u, cacheHitRate: rate }, 0)}` : '';
     $('#usage-label').textContent = `今日：${u.runs} 次运行 · ${fmtTokens(u.totalTokens)}${rateTxt}${costTxt}`;
-    $('#search-count-label').textContent = `搜索：${s.webSearchCount ?? u.webSearchCount ?? 0} 次`;
+    $('#search-count-label').textContent = `联网：${s.webSearchCount ?? u.webSearchCount ?? 0} 次`;
     state.paused = s.paused;
     state.pauseReason = s.pauseReason;
     $('#pause-btn').textContent = state.paused ? '恢复' : '暂停';
@@ -477,6 +477,7 @@ function connectSSE() {
     // sent/finishReason 等收尾字段：后端给了才进 patch。
     // 不能无脑写 null —— pending 合并时 null 会把之前已有的值冲掉。
     if (Array.isArray(data.sent)) patch.sent = data.sent;
+    for (const key of ['budget', 'terminationReason', 'finalization', 'searchUsageCalls', 'toolCounts']) if (data[key] !== undefined) patch[key] = data[key];
     if (data.finishReason !== undefined) patch.finishReason = data.finishReason;
     if (data.error !== undefined) patch.error = data.error;
     if (data.endedAt !== undefined) patch.endedAt = data.endedAt;
@@ -727,7 +728,7 @@ function renderSessionList() {
       ? `<span class="session-activity">${esc(s.activity)}</span>`
       : '';
     const searchHtml = Number(s.webSearchCount) > 0
-      ? `<span class="muted">搜 ${s.webSearchCount}</span>`
+      ? `<span class="muted">联网 ${s.webSearchCount}</span>`
       : '';
     const isNew = !state.seenSessionIds.has(s.id);
     return `
@@ -838,18 +839,22 @@ function renderSessionDetail(s) {
         <span>开始 ${fmtClock(s.startedAt)}${s.endedAt ? ` · 结束 ${fmtClock(s.endedAt)}` : ' · 进行中'}</span>
         <span>模型 ${esc(s.model || '-')}</span>
         <span>${usage.calls || 0} 次调用 · ${fmtTokens(usage.promptTokens)} 入 / ${fmtTokens(usage.completionTokens)} 出 / ${fmtTokens(usage.totalTokens)} 总</span>
-        <span>${s.rounds || 0} 轮工具</span>
-        <span>联网搜索 ${Number(s.webSearchCount) || 0} 次</span>
+        <span>${s.rounds || 0} 轮模型</span>
+        <span>联网操作 ${Number(s.webSearchCount) || 0} 次</span>
       </div>
     </div>`);
 
+  if (s.budget || s.searchUsageCalls?.length) {
+    const searchTokens = (s.searchUsageCalls || []).reduce((n, r) => n + (r.usage?.totalTokens || 0), 0);
+    html.push(`<details class="collapsible"><summary>预算与结束原因 · 搜索子模型 ${fmtTokens(searchTokens)} token</summary><div class="coll-body">${esc(JSON.stringify({ reason: s.terminationReason || '运行中', budget: s.budget, finalization: s.finalization, tools: s.toolCounts, searchUsage: s.searchUsageCalls }, null, 2))}</div></details>`);
+  }
   if (s.command || s.permissionAudit?.length) {
     html.push(`<details class="collapsible"><summary>权限与命令记录</summary><div class="coll-body">${esc(JSON.stringify({ command: s.command || null, audit: s.permissionAudit || [], results: s.command ? s.messages : undefined }, null, 2))}</div></details>`);
   }
   if (s.contextSelection) {
     const c = s.contextSelection;
     html.push(`<details class="collapsible"><summary>上下文选取：${c.historyIds.length} 条历史 · ${c.triggerIds.length} 条新消息 · ${c.memories.length} 条记忆</summary>
-      <div class="coll-body">${esc(`存档边界：${c.boundary}\n历史 local ID：${c.historyIds.join(', ')}\n新消息 local ID：${c.triggerIds.join(', ')}\n引用补充：${c.quoteIds.join(', ') || '无'}\n批次期间已读消息：${(c.interleavedIds || []).join(', ') || '无'}\n翻页游标：${c.beforeLocalId}\n` + c.memories.map((m) => `${m.id} v${m.version}（${m.kind}）：${m.reason}`).join('\n'))}</div></details>`);
+      <div class="coll-body">${esc(`存档边界：${c.boundary}\n历史窗口：${c.historyLimit ?? '?'} → ${c.maxHistory ?? c.historyLimit ?? '?'} 条${c.rolledOver ? '（本轮已裁回基础条数）' : ''}\n历史 local ID：${c.historyIds.join(', ')}\n新消息 local ID：${c.triggerIds.join(', ')}\n引用补充：${c.quoteIds.join(', ') || '无'}\n批次期间已读消息：${(c.interleavedIds || []).join(', ') || '无'}\n翻页游标：${c.beforeLocalId}\n` + c.memories.map((m) => `${m.id} v${m.version}（${m.kind}）：${m.reason}`).join('\n'))}</div></details>`);
   }
   const jsonMode = state.sessionJsonMode === s.id;
   if (jsonMode) {
@@ -861,10 +866,13 @@ function renderSessionDetail(s) {
       systemPrompt: s.systemPrompt || '',
       userPrompt: s.userPrompt || '',
       contextSelection: s.contextSelection || null,
+      usageByPhase: s.usageByPhase || null,
+      budget: s.budget, terminationReason: s.terminationReason, finalization: s.finalization, searchUsageCalls: s.searchUsageCalls, toolCounts: s.toolCounts,
       command: s.command || null,
       permissionAudit: s.permissionAudit || [],
       commandResults: s.command ? s.messages : [],
       inputMessages: (s.inputMessages || []).map((m) => ({ role: m.role, content: m.content })),
+      runtimeNotices: (s.messages || []).filter(m => m.budgetNotice).map(m => ({ content: m.budgetNotice, phase: m.requestPhase || 'normal' })),
       llmMessages: (s.messages || []).filter((m) => m.role === 'assistant').map((m) => ({
         role: m.role,
         content: m.content,
@@ -911,6 +919,8 @@ function renderSessionDetail(s) {
             <div class="tool-args">${esc(JSON.stringify(item.toolCall.args, null, 1))}</div>
             <div class="tool-result ${item.toolCall.isError ? 'is-error' : ''}">${esc(item.toolCall.result)}</div>
           </div>`);
+      } else if (item.budgetNotice) {
+        html.push(`<details class="collapsible"><summary>运行预算与收尾提示</summary><div class="coll-body">${esc(item.budgetNotice)}</div></details>`);
       } else if (item.toolImages) {
         html.push(`
           <div class="tool-card">
@@ -1394,7 +1404,7 @@ function renderUsagePage(stats, st, prices) {
            五张卡固定一行（曾经第一张跨两列、整体占两行，已按需求改单行）。 -->
       <div class="usage-cards">
         <div class="usage-card accent">
-          <div class="uc-label">估算成本</div>
+          <div class="uc-label">聊天模型估算成本</div>
           <div class="uc-value" data-field="cost">-</div>
           <div class="uc-sub" data-field="cost-sub">-</div>
         </div>
@@ -1421,6 +1431,8 @@ function renderUsagePage(stats, st, prices) {
         </div>
       </div>
 
+      <p class="hint" data-field="rate-phases"></p>
+      <p class="hint" data-field="search-usage"></p>
       <div data-block="days">
         <h3 class="usage-h3">按天</h3>
         <table class="usage-table clickable" data-table="days">
@@ -1478,6 +1490,9 @@ function renderUsagePage(stats, st, prices) {
 }
 
 /** 只更新数值与表格行，不碰骨架。 */
+function fmtCacheRate(usage, digits = 1) {
+  return usage?.cacheHitRate == null ? '未报告' : `${(usage.cacheHitRate * 100).toFixed(digits)}%${usage.cacheUnreportedCalls > 0 ? '（部分）' : ''}`;
+}
 function updateUsagePage(stats, st, prices) {
   const box = $('#usage-page');
   if (!box) return;
@@ -1501,15 +1516,14 @@ function updateUsagePage(stats, st, prices) {
   // 搜索次数：只列数量，不参与成本计算（搜索通常是资源包或免费的）
   const searches = Number(stats?.searchCount) || 0;
   set('search', fmtTok(searches));
-  set('search-sub', searches
-    ? (Number(stats?.toolCounts?.web_search) || 0) + (Number(stats?.toolCounts?.web_fetch) || 0) === searches
-      ? '联网搜索 + 抓网页'
-      : '联网搜索 + 抓网页'
-    : '本区间没有联网');
+  set('search-sub', `搜索 ${searches} · 读网页 ${stats?.toolCounts?.web_fetch || 0} · 取图 ${stats?.toolCounts?.get_webpage_images || 0}`);
+  const su = stats?.searchUsage || {};
+  set('search-usage', `搜索子模型（独立统计）：输入 ${fmtTok(su.promptTokens)} / 输出 ${fmtTok(su.completionTokens)} / 总计 ${fmtTok(su.totalTokens)} token；估算 ${fmtYuan(su.cost)}；${su.unreportedCalls || 0} 次未报告用量${su.legacySearchSessions ? '；旧记录可能不完整' : ''}。${(su.models || []).map(m => `${m.key}: ${fmtTok(m.totalTokens)} token`).join('；')}`);
   set('prompt', fmtTok(t.promptTokens));
   set('prompt-sub', `输出 ${fmtTok(t.completionTokens)}`);
-  set('rate', `${((t.cacheHitRate || 0) * 100).toFixed(1)}%`);
-  set('rate-sub', `命中 ${fmtTok(t.cachedTokens)} / 输入 ${fmtTok(t.promptTokens)}`);
+  set('rate', fmtCacheRate(t));
+  set('rate-sub', t.cacheHitRate == null ? '接口未提供缓存数据，不能判定为 0%' : `已报告命中 ${fmtTok(t.cacheReportedCachedTokens ?? t.cachedTokens)} / 输入 ${fmtTok(t.cacheReportedPromptTokens ?? t.promptTokens)}；未报告 ${t.cacheUnreportedCalls || 0} 次`);
+  set('rate-phases', `首次请求：${fmtCacheRate(stats?.phases?.first)} · 工具续轮：${fmtCacheRate(stats?.phases?.continuation)} · 收尾：${fmtCacheRate(stats?.phases?.finalization)}${stats?.phases?.unknown?.runs ? ' · 部分旧记录无法区分轮次' : ''}。缓存未报告的输入按未命中价估算成本。`);
   set('cost', fmtYuan(t.cost));
   set('cost-sub', stats?.rangeLabel || '');
   const bar = box.querySelector('[data-field="rate-bar"]');
@@ -1563,8 +1577,8 @@ function updateUsagePage(stats, st, prices) {
       <td class="r">${d.runs}</td>
       <td class="r">${fmtTok(d.promptTokens)}</td>
       <td class="r">${fmtTok(d.completionTokens)}</td>
-      <td class="r">${fmtTok(d.cachedTokens)}</td>
-      <td class="r">${((d.cacheHitRate || 0) * 100).toFixed(0)}%</td>
+      <td class="r">${d.cacheHitRate == null ? '未报告' : fmtTok(d.cacheReportedCachedTokens ?? d.cachedTokens)}</td>
+      <td class="r">${fmtCacheRate(d, 0)}</td>
       <td class="r">${fmtYuan(d.cost)}</td>
     </tr>`);
 
@@ -1574,7 +1588,7 @@ function updateUsagePage(stats, st, prices) {
       <td class="r">${c.runs}</td>
       <td class="r">${fmtTok(c.promptTokens)}</td>
       <td class="r">${fmtTok(c.completionTokens)}</td>
-      <td class="r">${((c.cacheHitRate || 0) * 100).toFixed(0)}%</td>
+      <td class="r">${fmtCacheRate(c, 0)}</td>
       <td class="r">${fmtYuan(c.cost)}</td>
     </tr>`);
 
@@ -1586,7 +1600,7 @@ function updateUsagePage(stats, st, prices) {
       <td class="r">${m.runs}</td>
       <td class="r">${fmtTok(m.promptTokens)}</td>
       <td class="r">${fmtTok(m.completionTokens)}</td>
-      <td class="r">${((m.cacheHitRate || 0) * 100).toFixed(0)}%</td>
+      <td class="r">${fmtCacheRate(m, 0)}</td>
       <td class="r">${fmtYuan(m.cost)}</td>
     </tr>`, { collapsible: true, expandBtn: '#models-expand' });
 }
@@ -1756,7 +1770,7 @@ function openUsageBreakdown(dim, key) {
               <td class="r">${x.runs}</td>
               <td class="r">${fmtTok(x.promptTokens)}</td>
               <td class="r">${fmtTok(x.completionTokens)}</td>
-              <td class="r">${((x.cacheHitRate || 0) * 100).toFixed(0)}%</td>
+              <td class="r">${fmtCacheRate(x, 0)}</td>
               <td class="r">${fmtYuan(x.cost)}</td>
             </tr>`).join('')
         : '<tr><td colspan="6" class="muted">无数据</td></tr>';
@@ -2634,6 +2648,13 @@ function renderPermissionsSection(c) {
     </div></details>`;
 }
 
+const RUN_LIMIT_FIELDS = [
+  ['maxToolCalls', '常规工具调用预算（每个调用单独计数）', 12, 1, 100],
+  ['maxSearchCalls', '搜索次数预算', 3, 0, 20], ['maxPageReads', '网页正文读取预算', 4, 0, 20],
+  ['maxImagePages', '网页取图预算', 4, 0, 20], ['maxInputTokens', '聊天模型累计输入 token 预算', 120000, 1000, 2000000],
+  ['maxRunMs', '常规处理时长预算（毫秒）', 180000, 10000, 1800000],
+  ['noProgressLimit', '连续无进展次数', 3, 2, 10], ['toolResultMaxChars', '单次工具文字上限', 6000, 1000, 20000]
+];
 function renderApiSection(c) {
   const currentProvider = (state.providers || []).find((p) => p.id === c.api.provider);
   const currentModelDisplay = (currentProvider?.modelNames || {})[c.api.model] || c.api.model;
@@ -2664,7 +2685,9 @@ function renderApiSection(c) {
     </div>
     <div class="field-row">
       <div class="field"><label>温度</label><input type="number" id="cfg-temperature" step="0.1" min="0" max="2" value="${esc(c.api.temperature)}" /></div>
-      <div class="field"><label>单次运行最大工具轮数</label><input type="number" id="cfg-maxrounds" min="1" max="40" value="${esc(c.api.maxRounds)}" /></div>
+      <div class="field"><label>单次运行常规模型请求预算</label><input type="number" id="cfg-maxrounds" min="1" max="40" value="${esc(c.api.maxRounds)}" /></div>
+      ${RUN_LIMIT_FIELDS.map(([key, label, fallback, min, max]) => `<div class="field"><label>${label}</label><input type="number" id="cfg-run-${key}" min="${min}" max="${max}" value="${esc(c.runLimits?.[key] ?? fallback)}"></div>`).join('')}
+      <div class="hint">模型请求和工具执行分别计数，0 次分类预算表示关闭该类探索。每轮末尾向模型提示剩余额度。耗尽或连续无进展且未回复时，独立收尾最多 3 次模型请求、4 次工具执行，允许已有图片导入、看图和发送，每种工具最多一次；仍未回复再保留一次纯文字请求。不再搜索或生图，不自动重试收尾。token 和时长在请求之间检查，单次请求可能越过阈值。搜索子模型 token 单独统计。</div>
     </div>
     <div class="checkbox-row"><input type="checkbox" id="cfg-vision" ${c.api.vision !== false ? 'checked' : ''} />
       <label for="cfg-vision">图片输入（关闭则移除看图工具，模型只会看到 [图片] 占位符）</label>
@@ -3188,9 +3211,10 @@ const RESPONSE_FIELDS = [
   ['cooldownMs', '自动参与冷却（毫秒）', 20000, 0, 300000],
   ['maxPerMinute', '每滚动 60 秒最多自动参与次数', 2, 1, 20]
 ];
+const PRIVATE_RESPONSE_FIELDS = [['privateQuietMs', '私聊连发等待空隙（毫秒）', 2000, 0, 30000], ['privateMaxWaitMs', '私聊连续输入最多等待（毫秒）', 15000, 1000, 60000]];
 const RESPONSE_MODES = [['rules', '热聊 / 冷场 / 保底规则（群聊）'], ['direct', '仅 @ / 关键词'], ['all', '每批调用模型'], ['legacy', '旧档位']];
 function responseRuleValues(c) {
-  return { groupMode: 'rules', hotEnabled: true, silenceEnabled: true,
+  return { groupMode: 'rules', privateMode: 'all', privateQuietMs: 2000, privateMaxWaitMs: 15000, hotEnabled: true, silenceEnabled: true,
     ...Object.fromEntries(RESPONSE_FIELDS.map(([key, , value]) => [key, value])), ...(c.responseRules || {}) };
 }
 function renderResponseOverride(key, value) {
@@ -3199,7 +3223,7 @@ function renderResponseOverride(key, value) {
     <div class="field"><label>响应方式</label><select data-rule="mode"><option value="">跟随默认</option>
     ${RESPONSE_MODES.filter(([mode]) => isGroup || mode !== 'rules').map(([mode, title]) => `<option value="${mode}" ${value.mode === mode ? 'selected' : ''}>${title}</option>`).join('')}</select></div>
     ${isGroup ? ['hotEnabled', 'silenceEnabled'].map((key, i) => `<div class="field"><label>${i ? '冷场接话' : '热聊参与'}</label><select data-rule="${key}"><option value="">跟随默认</option><option value="true" ${value[key] === true ? 'selected' : ''}>开启</option><option value="false" ${value[key] === false ? 'selected' : ''}>关闭</option></select></div>`).join('') : ''}
-    <div class="field-row">${(isGroup ? RESPONSE_FIELDS : []).map(([field, label, , min, max]) => `<div class="field"><label>${label}</label><input type="number" data-rule="${field}" min="${min}" max="${max}" placeholder="跟随默认" value="${esc(value[field] ?? '')}"></div>`).join('')}</div>
+    <div class="field-row">${(isGroup ? RESPONSE_FIELDS : PRIVATE_RESPONSE_FIELDS).map(([field, label, , min, max]) => `<div class="field"><label>${label}</label><input type="number" data-rule="${field}" min="${min}" max="${max}" placeholder="跟随默认" value="${esc(value[field] ?? '')}"></div>`).join('')}</div>
     <div class="field"><label>旧档位滑条位置（0～100，仅旧档位模式生效）</label><input type="number" data-rule="sliderPos" min="0" max="100" step="0.5" placeholder="跟随原档位设置" value="${esc(value.sliderPos ?? '')}"></div>
     <button type="button" class="btn btn-small" data-remove-response="${esc(key)}">移除单独设置</button></details>`;
 }
@@ -3209,6 +3233,10 @@ function renderResponseRules(c) {
   return `<h3>群聊自动参与</h3>
     <div class="hint">默认对所有允许接入的群聊启用，私聊不使用自动参与规则。热聊、冷场、累计消息保底默认共用每群滚动 60 秒 2 次额度，即使模型保持沉默也计一次；@、关键词和命令不占自动参与额度。热聊默认统计最近 1 分钟，保底默认累计 20 条未触发消息，不受热聊时间窗口限制。规则替代旧的随机冷场开话题。</div>
     <div class="field"><label>群聊默认响应方式</label><select id="response-group-mode">${RESPONSE_MODES.map(([mode, title]) => `<option value="${mode}" ${r.groupMode === mode ? 'selected' : ''}>${title}</option>`).join('')}</select></div>
+    <h3>私聊响应</h3><div class="hint">独立于群聊和旧档位。默认每批新消息都回应，连发合并为一批，持续输入最多等 15 秒；不使用热聊、冷场、保底或群聊自动参与额度。</div>
+    <div class="field"><label>私聊默认响应方式</label><select id="response-private-mode">${RESPONSE_MODES.filter(([mode]) => mode !== 'rules').map(([mode, title]) => `<option value="${mode}" ${r.privateMode === mode ? 'selected' : ''}>${mode === 'all' ? '每批回应（连续输入合并）' : title}</option>`).join('')}</select></div>
+    <div class="field-row">${PRIVATE_RESPONSE_FIELDS.map(([key, label, , min, max]) => `<div class="field"><label>${label}</label><input id="response-${key}" type="number" min="${min}" max="${max}" value="${esc(r[key])}"></div>`).join('')}</div>
+    <h3>群聊规则参数</h3>
     <div class="checkbox-row"><input id="response-hot" type="checkbox" ${r.hotEnabled ? 'checked' : ''}><label for="response-hot">热聊参与：多人交流或单人连续发言达到阈值</label></div>
     <div class="checkbox-row"><input id="response-silence" type="checkbox" ${r.silenceEnabled ? 'checked' : ''}><label for="response-silence">冷场接话：最后一条是人的消息，静默后给一次接话机会</label></div>
     <details><summary>默认规则参数</summary><div class="field-row">${RESPONSE_FIELDS.map(([key, label, , min, max]) => `<div class="field"><label>${label}</label><input id="response-${key}" type="number" min="${min}" max="${max}" value="${esc(r[key])}"></div>`).join('')}</div></details>
@@ -3231,7 +3259,7 @@ function renderChatSection(c) {
 return `
     <h3>运行节奏</h3>
     <div class="field-row">
-      <div class="field"><label>防抖聚批窗口（毫秒）—— 等连发消息聚成一批再开运行</label><input type="number" id="cfg-wakedelay" min="0" value="${esc(c.wakeDelayMs)}" /></div>
+      <div class="field"><label>群聊防抖聚批窗口（毫秒）—— 私聊在下方独立设置</label><input type="number" id="cfg-wakedelay" min="0" value="${esc(c.wakeDelayMs)}" /></div>
       <div class="field"><label>批次间隔（毫秒）—— 上轮结束到下轮处理的间隔</label><input type="number" id="cfg-draindelay" min="0" value="${esc(c.drainDelayMs)}" /></div>
       <div class="field"><label>同时处理几个会话</label><input type="number" id="cfg-maxruns" min="1" max="8" value="${esc(c.maxConcurrentRuns)}" /></div>
     </div>
@@ -3267,7 +3295,7 @@ return `
     </div>
 
     <h3>兼容模式：响应档位</h3>
-    <div class="hint">只对选择“旧档位”的会话生效。群聊默认使用上方热聊/冷场/保底规则；私聊默认沿用旧档位。单会话设置优先于统一设置。</div>
+    <div class="hint">只对选择“旧档位”的会话生效。群聊默认使用上方热聊/冷场/保底规则；私聊默认每批回应，连发合并。单会话设置优先于统一设置。</div>
 
     <div class="checkbox-row"><input type="checkbox" id="cfg-unifiedtier" ${st.unifiedTier !== false ? 'checked' : ''} />
       <label for="cfg-unifiedtier">统一设置全部响应档位（关掉就能给每个白名单群聊单独拖档位）</label></div>
@@ -3309,7 +3337,7 @@ return `
       <div class="hint" id="ctx-tier-note-g" style="margin-top:8px"></div>
       <div style="margin-top:8px;display:flex;gap:8px;align-items:center">
         <button class="btn btn-small btn-danger" id="tier-group-clear-btn">清除该群的单独设置</button>
-        <span class="hint" style="margin:0">没单独设置过的群聊和所有私聊，跟随上方统一档位的滑条位置。</span>
+        <span class="hint" style="margin:0">仅选择“旧档位”的会话使用这些滑条；群聊和私聊的默认响应方式在上方分别设置。</span>
       </div>
     </div>
 
@@ -3319,11 +3347,11 @@ return `
     <h3>聊天窗口</h3>
     <div class="field"><label>历史消息条数</label>
       <input type="number" id="cfg-history-count" min="0" max="500" value="${esc(st.historyCount ?? 80)}" />
-      <div class="hint">每次发送最近 N 条历史 + 本次全部新消息。响应档位只控制何时回应；完整聊天存档始终保留。窗口不按天截断，之前运行的工具输出不带入。</div>
+      <div class="hint">历史从 N 条起步，允许增长到向上取整的 1.5N 条，超出后裁回 N 条；每次附带本次全部新消息。响应档位只控制何时回应；完整聊天存档始终保留。窗口不按天截断，之前运行的工具输出不带入。</div>
     </div>
     <div class="field"><label>单独设置会话窗口（可选，每行一个）</label>
       <textarea id="cfg-chat-history" rows="3" placeholder="group:123456=100&#10;private:123456=60">${esc(Object.entries(st.chatHistoryCounts || {}).map(([key, count]) => `${key}=${count}`).join('\n'))}</textarea>
-      <div class="hint">格式：group:群号=条数 或 private:QQ号=条数；留空跟随上方设置，范围 0–500。</div>
+      <div class="hint">格式：group:群号=条数 或 private:QQ号=条数；留空跟随上方设置，范围 0–500。历史可增长到设置值的 1.5 倍，超过后裁回设置值；默认 80→120，0 不带历史。原始存档不删。</div>
     </div>
 
     <h3>屏蔽名单</h3>
@@ -4632,6 +4660,7 @@ async function saveConfig({ quiet = false } = {}) {
   }
 
   if (sec === 'api') {
+    patch.runLimits = Object.fromEntries(RUN_LIMIT_FIELDS.map(([key, , fallback, min, max]) => [key, Math.min(max, Math.max(min, Number(val(`#cfg-run-${key}`, c.runLimits?.[key] ?? fallback))))]));
     patch.api = {
       vision: chk('#cfg-vision', c.api.vision !== false),
       temperature: Number(val('#cfg-temperature', c.api.temperature)) || 0.8,
@@ -4775,9 +4804,10 @@ async function saveConfig({ quiet = false } = {}) {
     patch.proactive = { ...c.proactive, enabled: false };
     const ruleDefaults = responseRuleValues(c);
     patch.responseRules = { ...ruleDefaults, groupMode: val('#response-group-mode', ruleDefaults.groupMode),
+      privateMode: val('#response-private-mode', ruleDefaults.privateMode),
       hotEnabled: chk('#response-hot', ruleDefaults.hotEnabled), silenceEnabled: chk('#response-silence', ruleDefaults.silenceEnabled),
       chats: { __replace__: JSON.parse($('#response-chat-json')?.value || '{}') } };
-    for (const [key] of RESPONSE_FIELDS) patch.responseRules[key] = Number(val(`#response-${key}`, ruleDefaults[key]));
+    for (const [key] of [...RESPONSE_FIELDS, ...PRIVATE_RESPONSE_FIELDS]) patch.responseRules[key] = Number(val(`#response-${key}`, ruleDefaults[key]));
     patch.sticker = {
       ...c.sticker,
       enabled: chk('#cfg-sticker', c.sticker?.enabled !== false),

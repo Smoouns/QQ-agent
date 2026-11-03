@@ -135,12 +135,12 @@ await check('工具按主题检索、按 ID 展开旧版本，历史也检查可
 });
 
 let promptSession;
-await check('输入按环境、记忆、历史、引用、新消息组装；人设只进 system', () => {
+await check('聊天正文保持稳定前缀，动态环境、记忆和本轮序号放在末尾；人设只进 system', () => {
   const old = append('group:1', '联机讨论'); store.markAllRead('group:1');
   const m = append('group:1', '策略游戏周日联机？', { reply: { mid: old.mid } });
   promptSession = {};
   const input = buildUserPrompt({ chatKey: 'group:1', kind: 'group', chatId: '1', store, memory, triggerEntries: [m], session: promptSession, contextLimit: 0 });
-  const markers = ['【当前时间】', '【记忆】', '【过去状态】', '【引用补充】', '【本次唤醒】'];
+  const markers = ['【聊天记录】', '【当前时间】', '【记忆】', '【引用补充】', '【本次唤醒】'];
   assert.deepEqual(markers.map((s) => input.indexOf(s)), markers.map((s) => input.indexOf(s)).sort((a, b) => a - b));
   assert.ok(input.includes('QQ:123') && input.includes('#'));
   assert.ok(!input.includes(cfg.persona.roleText));
@@ -219,8 +219,18 @@ try {
     assert.ok(!requests[start].messages[1].content.includes('运行期间到达'));
     assert.ok(requests[start + 1].messages.some((m) => m.role === 'tool'));
     assert.equal(store.unreadCount('group:21'), 1);
+    assert.equal(lastSession().usageByPhase.first.calls, 1);
+    assert.equal(lastSession().usageByPhase.continuation.calls, 1);
+    assert.equal(lastSession().usageByPhase.first.cacheUnreportedCalls, 1);
+    assert.equal(lastSession().usage.cacheReportedCalls, 0);
     await orch.wake('group:21');
-    assert.equal(requests.at(-1).messages.length, 2);
+    assert.equal(requests.at(-1).messages.length, 3);
+    assert.match(requests.at(-1).messages[2].content, /运行预算快照/);
+    assert.equal(lastSession().usageByPhase.first.calls, 1);
+    assert.equal(lastSession().usageByPhase.continuation.calls, 0);
+    assert.deepEqual(requests[start].tools, requests.at(-1).tools);
+    const stablePrefix = requests[start].messages[1].content.split('\n\n【当前时间】')[0];
+    assert.ok(requests.at(-1).messages[1].content.startsWith(stablePrefix));
     assert.ok(requests.at(-1).messages[1].content.includes('运行期间到达'));
   });
 

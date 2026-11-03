@@ -1,3 +1,5 @@
+import { searchUsageCalls, sumSearchUsage } from './search-usage.js';
+import { emptyUsage, cacheCoverage, CACHE_COUNTERS } from './llm.js';
 // 会话（运行）记录：每次 agent 处理 = 一个会话，完整留档供 UI 查看。
 // 文件：data/sessions/<id>.json；索引在内存里维护（最近优先）。
 import fs from 'node:fs';
@@ -58,6 +60,9 @@ export class SessionRegistry {
       waitUntil: s.waitUntil ?? null,
       activity: s.activity ?? '',
       webSearchCount: s.webSearchCount ?? 0,
+      searchUsage: sumSearchUsage(searchUsageCalls(s)),
+      terminationReason: s.terminationReason ?? null,
+      budget: s.budget ?? null, toolCounts: s.toolCounts ?? null,
       outcome: s.outcome ?? null,            // { sent: n, finishReason }
       usage: s.usage ?? null,
       model: s.model ?? '',
@@ -89,7 +94,7 @@ export class SessionRegistry {
       feedbacks: [],
       finishReason: null,
       error: null,
-      usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0, cachedTokens: 0, calls: 0 }
+      usage: emptyUsage()
     };
     this.current.set(session.id, session);
     this.#persist(session);
@@ -208,6 +213,7 @@ export class SessionRegistry {
     let completionTokens = 0;
     let totalTokens = 0;
     let cachedTokens = 0;
+    const coverage = cacheCoverage(null);
     let runs = 0;
     let webSearchCount = 0;
     // 结束的会话记在汇总文件里
@@ -218,6 +224,7 @@ export class SessionRegistry {
         completionTokens = data.completionTokens || 0;
         totalTokens = data.totalTokens || 0;
         cachedTokens = data.cachedTokens || 0;
+        Object.assign(coverage, cacheCoverage(data));
         runs = data.runs || 0;
         webSearchCount = data.webSearchCount || 0;
       }
@@ -228,9 +235,10 @@ export class SessionRegistry {
       completionTokens += s.usage.completionTokens;
       totalTokens += s.usage.totalTokens;
       cachedTokens += Number(s.usage.cachedTokens) || 0;
+      for (const key of CACHE_COUNTERS) coverage[key] += Number(s.usage[key]) || 0;
       webSearchCount += Number(s.webSearchCount) || 0;
     }
-    return { dayKey, promptTokens, completionTokens, totalTokens, cachedTokens, runs, webSearchCount };
+    return { dayKey, promptTokens, completionTokens, totalTokens, cachedTokens, ...coverage, runs, webSearchCount };
   }
 
   /** 在会话结束时累加今日用量。 */
@@ -239,12 +247,13 @@ export class SessionRegistry {
     let data = { dayKey, promptTokens: 0, completionTokens: 0, totalTokens: 0, cachedTokens: 0, runs: 0, webSearchCount: 0 };
     try {
       const parsed = JSON.parse(fs.readFileSync(path.join(DATA_DIR, 'usage-today.json'), 'utf8'));
-      if (parsed?.dayKey === dayKey) data = parsed;
+      if (parsed?.dayKey === dayKey) data = { ...parsed, ...cacheCoverage(parsed) };
     } catch { /* 新的一天 */ }
     data.promptTokens += s.usage.promptTokens;
     data.completionTokens += s.usage.completionTokens;
     data.totalTokens += s.usage.totalTokens;
     data.cachedTokens = (data.cachedTokens || 0) + (Number(s.usage.cachedTokens) || 0);
+    for (const key of CACHE_COUNTERS) data[key] = (Number(data[key]) || 0) + (Number(s.usage[key]) || 0);
     data.runs += 1;
     data.webSearchCount = (data.webSearchCount || 0) + (Number(s.webSearchCount) || 0);
     const tmp = path.join(DATA_DIR, 'usage-today.json.tmp');

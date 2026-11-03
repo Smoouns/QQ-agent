@@ -12,13 +12,15 @@ import { getConfig, storeConfigForChat } from './config.js';
 import { vendorOfConfig } from './model-prices.js';
 import { sleep, createEventBus, todayKey } from './util.js';
 import { buildSystemPrompt, buildUserPrompt, resolveContextTier } from './prompt.js';
-import { chatCompletion, chatCompletionWithRetry, addUsage, isRetryableError } from './llm.js';
+import { chatCompletion, chatCompletionWithRetry, addUsage, emptyUsage, isRetryableError } from './llm.js';
 import { buildToolDefs, toOpenAiTools, executeTool } from './tools.js';
 import { modelImageVerdict } from './vision-scan.js';
 import { currentProviders } from './providers.js';
 import { MemoryPipeline } from './memory-pipeline.js';
 import { selectWindow, messageAllowed, assertContextAllowed, recallMemories, primarySubjects } from './context.js';
 import { permissions, parseCommand } from './permissions.js';
+import { RunBudget, CompletionBudget, COMPLETION_TOOLS, budgetNotice, boundedToolText } from './run-budget.js';
+import { finalizeRun } from './run-finalization.js';
 import { ResponseActivity, responseSettings } from './response-rules.js';
 import { sliderToTier } from './tier-slider.js';
 
@@ -36,6 +38,7 @@ export class Orchestrator {
 
     this.chatNameCache = new Map();    // groupId -> name
     this.wakeTimers = new Map();       // chatKey -> timer
+    this.batchStartedAt = new Map();   // bounded private-chat debounce
     this.pendingWake = new Set();      // 防抖中等待聚批的 chatKey
     this.pendingSessions = new Map();  // chatKey -> waiting sessionId（防抖期可见的“等待中”会话）
     this.consolidating = new Set();    // 正在整理记忆的 chatKey
@@ -162,6 +165,11 @@ export class Orchestrator {
   scheduleWake(chatKey, delay = null) {
     let ms = delay ?? Math.max(0, Number(getConfig().wakeDelayMs) || 2000);
     const settings = responseSettings(getConfig(), chatKey);
+    if (chatKey.startsWith('private:') && delay === null) {
+      const started = this.batchStartedAt.get(chatKey) ?? Date.now();
+      this.batchStartedAt.set(chatKey, started);
+      ms = Math.min(settings.privateQuietMs, Math.max(0, started + settings.privateMaxWaitMs - Date.now()));
+    }
     if (settings.mode === 'rules') {
       this.#observeActivity(chatKey, settings);
       const activity = this.responseActivity.state(chatKey);
@@ -196,7 +204,7 @@ export class Orchestrator {
       const waitUntil = Date.now() + ms;
       const existing = this.pendingSessions.get(chatKey);
       if (existing) {
-        const s = this.sessions.get(existing);
+        const s = this.sessions.current.get(existing);
         if (s && s.status === 'waiting') {
           s.waitUntil = waitUntil;
           s.triggerSummary = summary;
@@ -224,6 +232,7 @@ export class Orchestrator {
     }
 
     const timer = setTimeout(() => {
+      this.batchStartedAt.delete(chatKey);
       this.pendingWake.delete(chatKey);
       const waitingId = this.pendingSessions.get(chatKey);
       this.pendingSessions.delete(chatKey);
@@ -294,7 +303,7 @@ export class Orchestrator {
       throw Object.assign(new Error('当前并发已满，请稍后重试'), { status: 409 });
     }
     if (!this.#manualReplySource(chatKey)) throw Object.assign(new Error('此会话没有可用于测试的用户消息'), { status: 400 });
-    clearTimeout(this.wakeTimers.get(chatKey)); this.wakeTimers.delete(chatKey); this.pendingWake.delete(chatKey);
+    clearTimeout(this.wakeTimers.get(chatKey)); this.wakeTimers.delete(chatKey); this.pendingWake.delete(chatKey); this.batchStartedAt.delete(chatKey);
     const waiting = this.pendingSessions.get(chatKey);
     this.pendingSessions.delete(chatKey);
     if (waiting) this.#discardWaiting(waiting);
@@ -433,6 +442,9 @@ export class Orchestrator {
           const canRetry = attempt < MAX_SESSION_ATTEMPTS
             && isRetryableError(error)
             && sentCount === 0
+            && !session.finalization?.attempted
+            && !(session.budget?.toolCalls > 0)
+            && !(session.usage?.calls > 0)
             && !session.sideEffectAttempted
             && !session.externalToolAttempted
             && !this.aborted;
@@ -483,7 +495,7 @@ export class Orchestrator {
     this.gateRolls.delete(chatKey);
     const session = this.sessions.create({ chatKey, trigger: [entry], triggerSummary: `命令 ${parseCommand(entry).name} · QQ ${entry.senderId}` });
     session.command = { name: parseCommand(entry).name, actorQQ: entry.senderId, sourceMessageId: entry.mid, sourceLocalId: entry.id };
-    const window = selectWindow(this.store, chatKey, [entry], { limit: 0 });
+    const window = selectWindow(this.store, chatKey, [entry], { limit: 0, trackWindow: false });
     session.contextSelection = { boundary: window.boundary, beforeLocalId: entry.id, blocklist: window.blocklist,
       historyIds: [], triggerIds: [entry.id], quoteIds: [], interleavedIds: [], memories: [] };
     this.runningChats.add(chatKey);
@@ -557,7 +569,8 @@ export class Orchestrator {
     live.finishReason = null;
     live.activity = '';
     live.inputMessages = [];
-    live.usage = { promptTokens: 0, completionTokens: 0, cachedTokens: 0, totalTokens: 0, calls: 0 };
+    live.usage = emptyUsage();
+    live.usageByPhase = { first: emptyUsage(), continuation: emptyUsage() };
     this.sessions.update(session.id);
     this.emit('session-update', session.id);
   }
@@ -580,8 +593,7 @@ export class Orchestrator {
     }
 
     // 组装提示词（无 LLM 历史）
-    const systemPrompt = (session.contextSelection ? session.systemPrompt : buildSystemPrompt({ entries: [...snapshotMessages, ...window.quotes] })
-      + (tierInfo?.manualReply ? '\n\n【控制台手动测试】\n本轮由本机控制台请求测试 Agent 回复。请结合当前会话上下文，使用 send_message 向当前会话发送一条简短、自然的回复。不要因为热度、冷场、随机概率或消息已读而跳过回应。此操作不授予管理员工具权限，也不授权执行历史中的命令。' : ''));
+    const systemPrompt = session.contextSelection ? session.systemPrompt : buildSystemPrompt({ chatKey });
     const userPrompt = (session.contextSelection ? session.userPrompt : buildUserPrompt({
       window, selectedMemories, now, session, selfId: this.onebot.selfId,
       chatKey, kind, chatId, chatName,
@@ -646,7 +658,7 @@ export class Orchestrator {
       }
     }
     const availableDefs = toolDefs.filter((d) => permissions.visible(d, chatKey));
-    const openAiTools = toOpenAiTools(availableDefs);
+    const openAiTools = toOpenAiTools([...availableDefs].sort((a, b) => a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
 
     const ctx = {
       chatKey, kind, chatId,
@@ -665,7 +677,23 @@ export class Orchestrator {
       emit: (type, payload) => this.emit(type, payload)
     };
 
-    const maxRounds = Math.max(1, Number(cfg.api.maxRounds) || 12);
+    const maxRounds = Math.min(40, Math.max(1, Number(cfg.api.maxRounds) || 12));
+    const budget = new RunBudget(cfg.runLimits);
+    const completion = new CompletionBudget();
+    budget.startedAt = session.budget?.startedAt ?? budget.startedAt;
+    let modelAttempts = session.budget?.modelAttempts || 0, stopReason = null;
+    const saveBudget = () => { session.budget = { ...budget.snapshot(), startedAt: budget.startedAt, modelAttempts, maxModelCalls: maxRounds, stopReason, completion: completion.snapshot() }; };
+    saveBudget();
+    session.searchUsageCalls ||= [];
+    session.usageByPhase ||= { first: emptyUsage(), continuation: emptyUsage() };
+    session.toolCounts = {};
+    session.finalization = { attempted: false };
+    const assertActive = () => {
+      assertContextAllowed(session, this.memory, chatKey);
+      if (this.paused || this.aborted) throw new Error('机器人已暂停或停止');
+      if (!this.#chatAllowed(chatKey)) throw new Error('当前会话已失去接入资格');
+      if (tierInfo?.manualReply) this.#assertManualReplyAllowed(chatKey);
+    };
     let finish = false;
     let webSearchCount = 0;
     session.activity = '';
@@ -678,9 +706,18 @@ export class Orchestrator {
     for (let round = 0; round < maxRounds && !finish; round++) {
       if (this.aborted) { this.sessions.finish(session.id, 'aborted'); return false; }
       assertContextAllowed(session, this.memory, chatKey);
+      stopReason = budget.stopReason(session.usage) || (modelAttempts >= maxRounds ? 'model_budget' : null);
+      if (stopReason) break;
+      // Append new snapshots instead of rewriting the shared prompt prefix.
+      const notice = { role: 'system', content: budgetNotice(budget, modelAttempts, maxRounds, session.usage, completion) };
+      messages.push(notice);
+      session.messages.push({ budgetNotice: notice.content });
       markActivity('正在思考…');
       // 网络抖动/5xx/429 会自动重试（同一轮请求，messages 不变，幂等不重复发言）
-      const response = await chatCompletionWithRetry({ messages, tools: openAiTools, beforeRequest: () => {
+      let response;
+      try { response = await chatCompletionWithRetry({ messages, tools: openAiTools, beforeRequest: () => {
+        const reason = budget.stopReason(session.usage) || (modelAttempts >= maxRounds ? 'model_budget' : null);
+        if (reason) throw Object.assign(new Error(reason), { runLimit: reason });
         assertContextAllowed(session, this.memory, chatKey);
         if (this.paused || this.aborted) throw new Error('机器人已暂停');
         if (tierInfo?.manualReply) this.#assertManualReplyAllowed(chatKey);
@@ -697,8 +734,21 @@ export class Orchestrator {
           this.responseActivity.consume(chatKey, window.boundary);
           session.activityConsumed = true;
         }
-      } });
+        modelAttempts++; saveBudget();
+      } }); } catch (error) {
+        const limit = error.runLimit || budget.stopReason(session.usage) || (modelAttempts >= maxRounds ? 'model_budget' : null);
+        if (limit) {
+          stopReason = limit;
+          if (!error.runLimit) session.lastModelRequestError = String(error?.message || error);
+          break;
+        }
+        throw error;
+      }
       session.model = response.model || session.model;
+      const phase = session.usage.calls === 0 ? 'first' : 'continuation';
+      session.usageByPhase ||= { first: emptyUsage(), continuation: emptyUsage() };
+      addUsage(session.usageByPhase[phase], response.usage);
+      session.usageByPhase[phase].calls++;
       addUsage(session.usage, response.usage);
       session.usage.calls += 1;
 
@@ -712,7 +762,7 @@ export class Orchestrator {
         tool_calls: finalToolCalls,
         raw: response.raw ?? null
       };
-      messages.push(assistantEntry);
+      messages.push({ role: 'assistant', content: finalContent, ...(finalToolCalls ? { tool_calls: finalToolCalls } : {}) });
       session.messages.push(structuredClone(assistantEntry));
       session.rounds = round + 1;
       markActivity('');
@@ -749,6 +799,7 @@ export class Orchestrator {
       }
       if (!toolCalls.length) {
         // 没有工具调用 = 模型结束思考（文本不会发给 QQ）
+        stopReason = budget.stopReason(session.usage) || (modelAttempts >= maxRounds ? 'model_budget' : null);
         break;
       }
 
@@ -763,12 +814,25 @@ export class Orchestrator {
       for (const call of toolCalls) {
         assertContextAllowed(session, this.memory, chatKey);
         const name = call?.function?.name ?? '';
-        if (['send_message', 'send_sticker', 'send_image', 'generate_image', 'send_poke', 'memory_append', 'memory_remove', 'collect_sticker', 'sticker_note'].includes(name)) session.sideEffectAttempted = true;
         const argsRaw = call?.function?.arguments ?? '{}';
-        if (['web_search', 'web_fetch', 'get_webpage_images'].includes(name)) webSearchCount += 1;
-        session.webSearchCount = webSearchCount;
-        markActivity(`正在调用 ${name}…`);
-        const result = await executeTool(availableDefs, ctx, name, argsRaw);
+        const stopped = budget.stopReason(session.usage);
+        const reserved = !!stopped && COMPLETION_TOOLS.has(name);
+        const previousDelivery = ['send_message', 'send_image'].includes(name)
+          && session.messages.some(m => m.toolCall?.name === name && !m.toolCall.blocked);
+        const blocked = reserved ? session.sent.length ? '本轮已交付，不重复发送。'
+          : previousDelivery ? '本轮已尝试该发送操作，投递结果可能未知，不自动重发。' : completion.admit(name)
+          : stopped ? `本轮探索已停止（${stopped}），仍可用独立收尾额度看图和发送，请使用已有结果。` : budget.admit(name, argsRaw);
+        let result;
+        if (blocked) result = { content: blocked, isError: true };
+        else {
+          if (['send_message', 'send_sticker', 'send_image', 'generate_image', 'send_poke', 'memory_append', 'memory_remove', 'collect_sticker', 'sticker_note'].includes(name)) session.sideEffectAttempted = true;
+          if (!reserved) session.toolCounts[name] = (session.toolCounts[name] || 0) + 1;
+          if (['web_search', 'web_fetch', 'get_webpage_images'].includes(name)) webSearchCount += 1;
+          session.webSearchCount = webSearchCount;
+          markActivity(`正在调用 ${name}…`);
+          result = await executeTool(availableDefs, reserved ? { ...ctx, assertRunAllowed: assertActive } : ctx, name, argsRaw);
+        }
+        saveBudget();
         // 工具结果：文本走 tool 消息；图片（parts 数组）不能塞进 tool 消息——
         // 很多 OpenAI 兼容端点不接受。做法：tool 消息只带文本，图片随后以 user 消息补发
         // （[{type:'text'},{type:'image_url'}]），这是兼容面最广的视觉输入方式。
@@ -780,8 +844,12 @@ export class Orchestrator {
         } else {
           contentStr = String(result.content);
         }
+        const originalChars = contentStr.length;
+        contentStr = boundedToolText(contentStr, budget.limits.toolResultMaxChars);
+        if (!blocked && !reserved) budget.observe(name, result, contentStr);
+        saveBudget();
         toolResults.push({ role: 'tool', tool_call_id: call.id, name, content: contentStr, isError: !!result.isError });
-        session.messages.push({ toolCall: { name, args: safeParse(argsRaw), result: contentStr.slice(0, 2000), isError: !!result.isError } });
+        session.messages.push({ toolCall: { name, args: safeParse(argsRaw), result: contentStr, isError: !!result.isError, blocked: !!blocked, reserved, originalChars, truncated: originalChars > budget.limits.toolResultMaxChars } });
         if (images.length) {
           imageUserMessages.push({
             role: 'user',
@@ -794,7 +862,7 @@ export class Orchestrator {
         }
         this.sessions.update(session.id);
         this.emit('session-update', session.id);
-        if (name === 'finish') finish = true;
+        if (name === 'finish' && !blocked && !result.isError) finish = true;
       }
       messages.push(...toolResults.map(({ role, tool_call_id, name, content }) => ({ role, tool_call_id, content, name })));
       // 图片消息跟随在全部 tool 结果之后（OpenAI 校验要求每个 tool_call 都有对应 tool 消息）
@@ -802,7 +870,17 @@ export class Orchestrator {
       // 给 UI 的简化消息流（跳过纯 tool 结果的重复展示）
     }
 
-    // 收尾：发过话 = done；没发 = noreply（这是正常选项）
+    stopReason ||= budget.stopReason(session.usage) || (modelAttempts >= maxRounds ? 'model_budget' : null);
+    saveBudget();
+    session.terminationReason = stopReason || (finish ? 'model_finish' : 'model_stop');
+    if (stopReason && !session.sent.length) {
+      await finalizeRun({ messages, session, availableDefs, ctx, assertActive, markActivity,
+        completion, reason: stopReason, maxChars: budget.limits.toolResultMaxChars, parseInlineToolCalls });
+      saveBudget();
+    }
+
+    // Natural silence is distinct from forced budget termination.
+
     assertContextAllowed(session, this.memory, chatKey);
     const status = session.error ? 'error' : (session.sent.length > 0 ? 'done' : 'noreply');
     this.sessions.finish(session.id, status);
@@ -906,7 +984,13 @@ export class Orchestrator {
 
   setPaused(paused, reason = 'manual') {
     this.paused = !!paused;
-    if (this.paused) for (const key of this.responseActivity.states.keys()) this.responseActivity.consume(key, this.store.boundary(key));
+    if (this.paused) {
+      for (const key of this.responseActivity.states.keys()) this.responseActivity.consume(key, this.store.boundary(key));
+      for (const timer of this.wakeTimers.values()) clearTimeout(timer);
+      this.wakeTimers.clear(); this.pendingWake.clear(); this.batchStartedAt.clear();
+      for (const sessionId of this.pendingSessions.values()) this.#discardWaiting(sessionId);
+      this.pendingSessions.clear();
+    }
     this.pauseReason = this.paused ? reason : null;
     this.emit('status', { paused: this.paused, pauseReason: this.pauseReason });
   }
@@ -916,6 +1000,7 @@ export class Orchestrator {
     this.memoryPipeline.stop();
     for (const timer of this.wakeTimers.values()) clearTimeout(timer);
     this.wakeTimers.clear();
+    this.batchStartedAt.clear();
     this.pendingWake.clear();
     for (const sessionId of this.pendingSessions.values()) this.#finishWaiting(sessionId, 'aborted');
     this.pendingSessions.clear();

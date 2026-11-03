@@ -84,7 +84,7 @@ await check('截断、失败、不完整及坏 JSON 不返回部分成功', asyn
 await check('响应读取与返回给聊天模型的总结都有上限', async () => {
   const message = structuredClone(messageItem); message.content[0].text = '长'.repeat(7000);
   const result = await readSearchResponse(Response.json(completed([searchItem, message]).response), '测试');
-  assert.equal(result.summary.length, 6000); assert.equal(result.summaryTruncated, true);
+  assert.equal(result.summary.length, 1600); assert.equal(result.summaryTruncated, true);
   await assert.rejects(readSearchResponse(new Response(' '.repeat(2 * 1024 * 1024 + 1)), '测试'), /响应过大/);
 });
 await check('接口地址支持 v1 基址与完整 responses，拒绝夹带凭据的 URL', async () => {
@@ -125,10 +125,29 @@ try {
   await check('本地免 Key 模式不继承聊天 Key；Agent 工具实际返回总结和来源', async () => {
     cfg.webSearch.opencodex.apiKey = '';
     const def = buildToolDefs().find((t) => t.name === 'web_search');
-    const result = await def.execute({}, { query: '测试搜索' });
+    const ctx = { session: {} };
+    const result = await def.execute(ctx, { query: '测试搜索' });
+    assert.equal(ctx.session.searchUsageCalls.length, 1);
+    assert.equal(ctx.session.searchUsageCalls[0].usage.promptTokens, 12);
+    assert.equal(ctx.session.searchUsageCalls[0].usage.completionTokens, 4);
+    assert.equal(ctx.session.searchUsageCalls[0].usage.totalTokens, 16);
+    assert.equal(JSON.parse(result.content).usage, undefined);
     assert.equal(requests.at(-1).authorization, undefined);
     assert.ok(!result.isError); assert.match(result.content, /单位是毫秒/); assert.match(result.content, /example.org/);
     cfg.webSearch.opencodex.apiKey = 'proxy-key';
+  });
+  await check('搜索有消耗但无来源被拒绝时仍单独记录用量，HTTP 失败标记未报告', async () => {
+    const def = buildToolDefs().find(t => t.name === 'web_search');
+    const saved = handle;
+    try {
+      handle = (_req, res) => { res.setHeader('content-type', 'application/json'); res.end(JSON.stringify(completed([{ ...searchItem, action: {} }]).response)); };
+      const ctx = { session: {} };
+      const rejected = await def.execute(ctx, { query: '无来源' });
+      assert.equal(rejected.isError, true); assert.equal(ctx.session.searchUsageCalls[0].usage.totalTokens, 16);
+      handle = (_req, res) => { res.writeHead(500); res.end('failed'); };
+      await def.execute(ctx, { query: '接口失败' });
+      assert.equal(ctx.session.searchUsageCalls.length, 2); assert.equal(ctx.session.searchUsageCalls[1].usageReported, false);
+    } finally { handle = saved; }
   });
   await check('HTTP 错误不泄露上游回显的 Key，也不自动重试或回退 Bing', async () => {
     const before = requests.length;

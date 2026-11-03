@@ -61,13 +61,13 @@ export async function bingSearch(query) {
 }
 
 /** 给工具用的统一入口：搜索 + 紧凑序列化。 */
-export async function webSearch(query, { signal } = {}) {
+export async function webSearch(query, { signal, onUsage } = {}) {
   const clean = sanitizeQuery(query);
   if (!clean) throw new Error('查询词为空');
   const cfg = getConfig().webSearch ?? {};
   const provider = String(cfg.provider || 'bing').toLowerCase();
-  if (provider === 'opencodex') return openCodexSearch(clean, cfg.opencodex || {}, { signal, maxResults: cfg.maxResults });
-  if (provider === 'deepseek') return deepSeekSearch(clean);
+  if (provider === 'opencodex') return openCodexSearch(clean, cfg.opencodex || {}, { signal, maxResults: cfg.maxResults, onUsage });
+  if (provider === 'deepseek') return deepSeekSearch(clean, { onUsage });
   if (provider === 'zhipu') return zhipuSearch(clean);
   if (provider === 'bocha') return bochaSearch(clean);
   if (provider === 'baidu') return baiduSearch(clean);
@@ -86,7 +86,7 @@ export async function webSearch(query, { signal } = {}) {
  * 搜索结果生成的最终回答；URL/标题/摘要为黑盒，拿不到结构化来源。适合
  * “只要能搜到并总结”的场景；需要引用列表时请用 Bing / 其他搜索 API。
  */
-export async function deepSeekSearch(query) {
+export async function deepSeekSearch(query, { onUsage } = {}) {
   const cfg = getConfig().webSearch?.deepseek ?? {};
   const apiKey = String(cfg.apiKey || process.env.DEEPSEEK_API_KEY || '').trim();
   if (!apiKey) throw new Error('DeepSeek 搜索需要 API Key（设置里填，或环境变量 DEEPSEEK_API_KEY）');
@@ -112,6 +112,7 @@ export async function deepSeekSearch(query) {
     throw new Error(`DeepSeek 搜索 HTTP ${res.status}：${text.slice(0, 300)}`);
   }
   const data = await res.json().catch(() => { throw new Error('DeepSeek 搜索返回了无法解析的 JSON'); });
+  onUsage?.(data?.usage || null, data?.model || model);
   const outputText = String(data?.output_text ?? '').trim();
   if (!outputText) {
     // 兼容不同字段位置

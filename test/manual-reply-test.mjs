@@ -12,7 +12,7 @@ cfg.permissions.adminQQs = ['123'];
 setRuntimeConfig(cfg);
 const requests = [], sent = [];
 const toolCall = (name, args = {}) => ({ id: 'test-call', type: 'function', function: { name, arguments: JSON.stringify(args) } });
-let respond = (body) => body.messages.at(-1).role === 'tool' ? { content: '' }
+let respond = (body) => body.messages.some(m => m.role === 'tool') ? { content: '' }
   : { tool_calls: [toolCall('send_message', { messages: ['手动测试回复'] })] };
 const normalResponse = respond;
 const llm = http.createServer(async (req, res) => {
@@ -53,7 +53,8 @@ try {
     assert.equal(result.status, 200); assert.ok(result.data.sessionId);
     const s = await finished(result.data.sessionId);
     assert.equal(s.status, 'done'); assert.equal(s.responseDecision.manualReply, true);
-    assert.match(s.systemPrompt, /控制台手动测试/);
+    assert.match(s.userPrompt, /控制台手动测试/);
+    assert.doesNotMatch(s.systemPrompt, /控制台手动测试/);
     assert.deepEqual(sent.at(-1), { kind: 'group', id: '1', text: '手动测试回复' });
     assert.equal(app.store.unreadCount('group:1'), 0);
     assert.ok(!requests[0].tools.some((t) => t.function.name === 'get_computer_status'));
@@ -71,7 +72,7 @@ try {
     let statusReads = 0;
     const def = app.orchestrator.toolDefs.find((d) => d.name === 'get_computer_status'), old = def.execute;
     def.execute = async () => { statusReads++; return { content: 'sensitive' }; };
-    respond = (body) => body.messages.at(-1).role === 'tool' ? { content: '' } : { tool_calls: [toolCall('get_computer_status')] };
+    respond = (body) => body.messages.some(m => m.role === 'tool') ? { content: '' } : { tool_calls: [toolCall('get_computer_status')] };
     try {
       const result = await request('group:2'); const s = await finished(result.data.sessionId);
       assert.equal(statusReads, 0); assert.equal(s.status, 'noreply');

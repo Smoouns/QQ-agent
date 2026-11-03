@@ -204,30 +204,46 @@ export async function listModels() {
  * usage.prompt_tokens_details.cached_tokens 里返回它，成本看板与缓存命中率统计都依赖这个数。
  */
 export function addUsage(target, usage) {
-  if (!usage) return target;
-  const prompt = Number(usage.prompt_tokens) || 0;
-  const completion = Number(usage.completion_tokens) || 0;
+  const cached = reportedCacheTokens(usage);
+  usage ||= {};
+  const prompt = Number(usage.prompt_tokens ?? usage.input_tokens) || 0;
+  const completion = Number(usage.completion_tokens ?? usage.output_tokens) || 0;
   target.promptTokens += prompt;
   target.completionTokens += completion;
   target.totalTokens += Number(usage.total_tokens) || (prompt + completion);
   // 各家返回路径不同，逐个兼容
-  const cached = usage.prompt_tokens_details?.cached_tokens
-    ?? usage.prompt_cache_hit_tokens
-    ?? usage.cached_tokens
-    ?? 0;
-  target.cachedTokens = (Number(target.cachedTokens) || 0) + (Number(cached) || 0);
+  target.cachedTokens = (Number(target.cachedTokens) || 0) + Math.min(Number(cached) || 0, prompt);
+  const reported = cached !== null;
+  for (const [key, value] of Object.entries({
+    cacheReportedCalls: reported ? 1 : 0, cacheUnreportedCalls: reported ? 0 : 1,
+    cacheReportedPromptTokens: reported ? prompt : 0,
+    cacheReportedCachedTokens: reported ? Math.min(cached, prompt) : 0
+  })) target[key] = (Number(target[key]) || 0) + value;
   return target;
 }
 
+/** Missing is not a reported zero. Accept the OpenAI-compatible provider variants. */
+export function reportedCacheTokens(usage) {
+  const value = usage?.prompt_tokens_details?.cached_tokens ?? usage?.input_tokens_details?.cached_tokens
+    ?? usage?.prompt_cache_hit_tokens ?? usage?.cached_tokens ?? usage?.total_cached_tokens;
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : null;
+}
+export const CACHE_COUNTERS = ['cacheReportedCalls', 'cacheUnreportedCalls', 'cacheReportedPromptTokens', 'cacheReportedCachedTokens'];
+export function cacheCoverage(usage) {
+  const result = Object.fromEntries(CACHE_COUNTERS.map((key) => [key, Number(usage?.[key]) || 0]));
+  // Old aggregates synthesized cachedTokens=0, so that field alone is not evidence.
+  if (usage?.cacheReportedCalls == null && usage?.promptTokens > 0) result.cacheUnreportedCalls = Math.max(1, Number(usage.calls ?? usage.runs) || 0);
+  return result;
+}
 export function emptyUsage() {
-  return { promptTokens: 0, completionTokens: 0, totalTokens: 0, cachedTokens: 0, calls: 0 };
+  return { promptTokens: 0, completionTokens: 0, totalTokens: 0, cachedTokens: 0, calls: 0, ...cacheCoverage(null) };
 }
 
-/** 缓存命中率（0~1）。没有 prompt 数据时返回 0。 */
+/** Only the calls that explicitly report caching form the denominator. */
 export function cacheHitRate(usage) {
-  const p = Number(usage?.promptTokens) || 0;
-  if (!p) return 0;
-  return Math.min(1, Math.max(0, (Number(usage?.cachedTokens) || 0) / p));
+  const p = Number(usage?.cacheReportedPromptTokens) || 0;
+  if (!p) return null;
+  return Math.min(1, Math.max(0, (Number(usage?.cacheReportedCachedTokens) || 0) / p));
 }
 
 /**

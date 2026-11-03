@@ -713,6 +713,39 @@ try {
     } finally { sandbox.fetch = oldFetch; }
   }
 
+  console.log('\n=== 独立模型和工具预算设置 ===');
+  {
+    const settings = structuredClone(cfg);
+    settings.runLimits = { ...DEFAULT_CONFIG.runLimits, maxSearchCalls: 0 };
+    const html = ctx.renderApiSection(settings);
+    const renderOk = html.includes('cfg-maxrounds') && html.includes('cfg-run-maxToolCalls')
+      && html.includes('id="cfg-run-maxSearchCalls" min="0" max="20" value="0"')
+      && html.includes('cfg-run-maxInputTokens') && html.includes('cfg-run-noProgressLimit');
+    renderOk ? pass++ : fail++;
+    console.log('  ' + (renderOk ? 'OK   ' : 'FAIL ') + '模型、工具、输入与无进展预算独立显示，零搜索额度保留');
+    const savedFetch = sandbox.fetch;
+    try {
+      let posted;
+      sandbox.fetch = async (url, options) => {
+        if (url === '/api/config' && options?.method === 'POST') {
+          posted = JSON.parse(options.body);
+          return { ok: true, json: async () => ({ config: settings }) };
+        }
+        return savedFetch(url, options);
+      };
+      vm.runInContext(`state.config = ${JSON.stringify(settings)}; state.settingsSection = 'api';`, ctx);
+      document.querySelector('#cfg-maxrounds').value = '7';
+      document.querySelector('#cfg-run-maxToolCalls').value = '9';
+      document.querySelector('#cfg-run-maxSearchCalls').value = '0';
+      document.querySelector('#cfg-run-maxInputTokens').value = '80000';
+      await ctx.saveConfig();
+      if (posted?.api?.maxRounds !== 7 || posted?.runLimits?.maxToolCalls !== 9
+        || posted.runLimits.maxSearchCalls !== 0 || posted.runLimits.maxInputTokens !== 80000) throw new Error('预算保存不正确');
+      pass++; console.log('  OK   独立预算通过配置保存路径提交');
+    } catch (e) { fail++; console.log('  FAIL  预算设置保存：' + e.message); }
+    finally { sandbox.fetch = savedFetch; }
+  }
+
   console.log('\n=== 群聊响应规则设置 ===');
   {
     const settings = structuredClone(cfg);
@@ -727,9 +760,32 @@ try {
       ['默认规则与高级参数可渲染', html.includes('群聊自动参与') && html.includes('id="response-maxPerMinute"') && html.includes('value="2"')],
       ['一分钟热聊和累计保底参数可全局及逐群调整', html.includes('id="response-windowMs" type="number" min="1000" max="300000" value="60000"') && html.includes('id="response-fallbackMessages"') && group.includes('data-rule="fallbackMessages"') && !privateChat.includes('data-rule="fallbackMessages"')],
       ['群聊可覆盖规则、额度和关闭冷场', group.includes('data-rule="maxPerMinute"') && group.includes('value="4"') && group.includes('value="false" selected')],
+      ['群私聊默认方式和聚批参数分开展示', html.includes('id="response-private-mode"') && html.includes('id="response-privateQuietMs"') && html.includes('id="response-privateMaxWaitMs"') && privateChat.includes('data-rule="privateQuietMs"') && !group.includes('data-rule="privateQuietMs"')],
       ['私聊有独立响应方式但不能启用热聊冷场', privateChat.includes('value="direct" selected') && !privateChat.includes('value="rules"') && !privateChat.includes('data-rule="silenceMs"')],
       ['移除旧随机冷场入口，保留兼容档位', !html.includes('id="cfg-proactive"') && html.includes('兼容模式：响应档位')]
     ]) { ok ? pass++ : fail++; console.log('  ' + (ok ? 'OK   ' : 'FAIL ') + name); }
+    const savedFetch = sandbox.fetch;
+    try {
+      let posted;
+      sandbox.fetch = async (url, options) => {
+        if (url === '/api/config' && options?.method === 'POST') {
+          posted = JSON.parse(options.body);
+          return { ok: true, json: async () => ({ config: settings }) };
+        }
+        return savedFetch(url, options);
+      };
+      vm.runInContext(`state.config = ${JSON.stringify(settings)}; state.settingsSection = 'chat';`, ctx);
+      document.querySelector('#response-group-mode').value = 'direct';
+      document.querySelector('#response-private-mode').value = 'all';
+      document.querySelector('#response-privateQuietMs').value = '1500';
+      document.querySelector('#response-privateMaxWaitMs').value = '10000';
+      document.querySelector('#response-chat-json').value = JSON.stringify({ 'private:456': { mode: 'all', privateQuietMs: 500 } });
+      await ctx.saveConfig();
+      const r = posted?.responseRules;
+      if (r?.groupMode !== 'direct' || r.privateMode !== 'all' || r.privateQuietMs !== 1500 || r.privateMaxWaitMs !== 10000 || r.chats.__replace__['private:456'].privateQuietMs !== 500) throw new Error('群私聊设置未独立保存');
+      pass++; console.log('  OK   私聊默认方式、聚批参数与逐会话覆盖通过保存路径提交');
+    } catch (e) { fail++; console.log('  FAIL  私聊设置保存：' + e.message); }
+    finally { sandbox.fetch = savedFetch; }
   }
 
 } catch (e) {

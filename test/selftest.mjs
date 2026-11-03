@@ -336,12 +336,13 @@ refs:
 
   await waitFor(() => llm.state.requests.length >= 1, 5000, '第一次 LLM 调用');
   const req1 = llm.state.requests[0];
-  assert.strictEqual(req1.messages.length, 2, '第一次运行只应有 system+user 两条消息（零 LLM 历史）');
+  assert.strictEqual(req1.messages.length, 3, '第一次运行只有 system+user 和末尾预算提示（零 LLM 历史）');
+  assert.match(req1.messages[2].content, /运行预算快照/);
   assert.strictEqual(req1.messages[0].role, 'system');
   assert.strictEqual(req1.messages[1].role, 'user');
   const user1 = req1.messages[1].content;
   assert.ok(user1.includes('【本次唤醒】') && user1.includes('在吗？'), '用户消息含本次唤醒与触发文本');
-  assert.ok(user1.includes('【当前时间】') && user1.includes('【过去状态】'), '用户消息含时间与过去状态');
+  assert.ok(user1.includes('【当前时间】') && user1.includes('【聊天记录】'), '用户消息含时间与过去状态');
   assert.ok(req1.tools?.some((t) => t.function.name === 'send_message'), 'send_message 工具已暴露');
   const toolNames = req1.tools.map((t) => t.function.name);
   assert.ok(!toolNames.some((n) => n.includes('qq_')), '工具名不带 qq_ 前缀');
@@ -380,11 +381,12 @@ refs:
   // drain：运行 A 结束后自动开新会话处理 9011
   await waitFor(() => llm.state.requests.length >= reqsBeforeA + 2, 6000, 'drain 运行开始');
   const drainReq = llm.state.requests.at(-1);
-  assert.strictEqual(drainReq.messages.length, 2, 'drain 运行同样是全新会话（零历史）');
+  assert.strictEqual(drainReq.messages.length, 3, 'drain 运行同样是全新会话，加本轮预算提示（零历史）');
+  assert.match(drainReq.messages[2].content, /运行预算快照/);
   assert.ok(drainReq.messages[1].content.includes('处理期间插进来的新消息'), 'drain 运行的【本次唤醒】是处理期间插入的消息');
   assert.ok(!drainReq.messages[1].content.includes('在的"') || drainReq.messages[1].content.includes('我：在的'), '此前发言只以存档形式出现');
   await waitSessionDone('处理期间插进来的新消息');
-  pass('drain 循环：运行中新消息 → 结束后自动新开会话处理，每次 messages.length=2');
+  pass('drain 循环：运行中新消息 → 结束后新开会话，初始提示词与预算快照不含旧工具结果');
 
   const meta = app.store.getChatMeta('group:456');
   assert.strictEqual(meta.unread, 0, '所有消息已标记已读');
@@ -1242,10 +1244,10 @@ refs:
     const total = Object.values(tc).reduce((a, x) => a + Number(x) || 0, 0);
     assert.ok(total >= 0, '工具调用总计应为非负');
 
-    // 搜索次数 = web_search + web_fetch（后端就是这么累加的）
-    const searchFromTools = (Number(tc.web_search) || 0) + (Number(tc.web_fetch) || 0);
+    // 搜索与网页抓取、取图分开统计。
+    const searchFromTools = (Number(tc.web_search) || 0);
     assert.equal(searchFromTools, sc,
-      `searchCount(${sc}) 应等于 web_search+web_fetch(${searchFromTools})`);
+      `searchCount(${sc}) 应等于 web_search(${searchFromTools})`);
 
     // ★ 关键：搜索次数不能影响成本
     // 成本只由 token×单价算出，与 searchCount / 工具次数无关
