@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { DATA_DIR } from './config.js';
+import { acquireArchiveWriter } from './archive-writer-lease.js';
 
 const SESSIONS_DIR = path.join(DATA_DIR, 'sessions');
 
@@ -16,18 +17,22 @@ export function sessionFile(id) {
 }
 
 export class SessionRegistry {
+  #writer;
   /**
    * @param {number} keepFiles 保留最近多少个会话记录文件；**0 = 不限制**。
    *   注意：不能用 `x || 300` 兜底 —— 0 是 falsy 会被误当成"未设置"变回 300，
    *   用户想"取消上限"就永远改不掉。也不能 Math.max(20,…) 强制下限。
    */
   constructor(keepFiles = 0) {
+    this.#writer = acquireArchiveWriter('sessions');
     this.keepFiles = Math.max(0, Number.isFinite(Number(keepFiles)) ? Math.round(Number(keepFiles)) : 0);
     this.index = [];   // [{ id, chatKey, startedAt, endedAt, status, outcome, usage, trigger, model, promptChars }]
     this.current = new Map(); // id -> session object（运行中的在内存里）
     fs.mkdirSync(SESSIONS_DIR, { recursive: true });
     this.#loadIndex();
   }
+
+  close() { this.#writer.close(); }
 
   #loadIndex() {
     try {
@@ -63,6 +68,7 @@ export class SessionRegistry {
   }
 
   create({ chatKey, trigger, triggerSummary, status = 'running', waitUntil = null }) {
+    this.#writer.assertOpen();
     const session = {
       id: newSessionId(),
       chatKey,
@@ -121,6 +127,7 @@ export class SessionRegistry {
   }
 
   update(id) {
+    this.#writer.assertOpen();
     const s = this.current.get(id);
     if (s) {
       this.#persistThrottled(s);
@@ -140,6 +147,7 @@ export class SessionRegistry {
   }
 
   finish(id, status) {
+    this.#writer.assertOpen();
     const s = this.current.get(id);
     if (!s) return null;
     s.status = status;
@@ -175,6 +183,7 @@ export class SessionRegistry {
    *    已经跑过并消耗了 token 的会话要走 finish，别用这个抹掉用量记录。
    */
   discard(id) {
+    this.#writer.assertOpen();
     if (!id) return false;
     const s = this.current.get(id);
     // 已运行过的不允许丢弃（会抹掉用量/成本记录，导致对不上账）

@@ -67,7 +67,7 @@ export async function generateImage(chatKey, prompt, { beforeRequest = () => {},
     catch { throw new Error('生图接口返回了无效 JSON，本次名额已计入'); }
     // 不接受模型回复中的链接或本地路径；Images 接口必须返回真实的单张图片字节。
     if (!Array.isArray(result.data) || result.data.length !== 1 || !result.data[0]?.b64_json) throw new Error('生图接口没有返回单张 Base64 图片，本次名额已计入');
-    const image = saveImage(chatKey, decodeImage(result.data[0].b64_json), mode === 'edit' ? 'edited' : 'generated');
+    const image = saveImage(chatKey, decodeImage(result.data[0].b64_json), mode === 'edit' ? 'edited' : 'generated', { referenceImageIds });
     return { imageId: image.imageId, mime: image.mime, bytes: image.bytes, mode, referenceImageIds, budget };
   } finally { active.delete(chatKey); }
 }
