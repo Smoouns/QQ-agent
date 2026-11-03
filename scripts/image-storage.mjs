@@ -11,6 +11,7 @@ const HELP = `图片存储统计与保守回收
   --help                显示帮助
 
 完整图片始终保留，包括未发送、编辑参考图和发送失败后可重试的图片。
+执行清理前必须停止共享数据目录的所有应用进程；运行中只支持预览。
 不会按文件年龄删除图片，也不会删除不能确认归属或状态的文件。
 数据目录使用 QQ_AGENT_DATA_DIR，未设置时使用项目的 data/。`;
 
@@ -52,6 +53,7 @@ function printReport(report) {
   const { totals, summary } = report;
   console.log(report.dryRun ? '图片存储预览（dry-run，未删除任何文件）' : '图片存储清理结果');
   console.log(`范围：${report.scope ?? '全部会话'}`);
+  if (report.skipped) console.log('检测到存档写入者，未扫描存储内容，未执行清理；下方零计数不代表实际占用。');
   console.log(`已统计文件：${totals.files} 个，${size(totals.bytes)}；完整图片：${totals.completeImages} 张`);
   console.log(`未扫描目录：${totals.unscannedDirectories} 个；上述字节数为已统计文件的逻辑大小${totals.unscannedDirectories ? '，不包含这些目录内的占用' : '，不等于文件系统实际分配空间'}。`);
   console.log(`图片字节：${size(totals.imageBytes)}；元数据：${size(totals.metadataBytes)}；临时文件：${size(totals.temporaryBytes)}；其他：${size(totals.otherBytes)}`);

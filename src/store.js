@@ -17,7 +17,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { DATA_DIR } from './config.js';
-import { withImageStorageLock } from './image-storage-lock.js';
+import { acquireArchiveWriter } from './archive-writer-lease.js';
 
 const MESSAGES_DIR = path.join(DATA_DIR, 'messages');
 
@@ -41,17 +41,17 @@ function loadChat(chatKey) {
 }
 
 function saveChat(state) {
-  withImageStorageLock(() => {
-    fs.mkdirSync(MESSAGES_DIR, { recursive: true });
-    const tmp = `${chatFile(state.chatKey)}.${process.pid}.tmp`;
-    fs.writeFileSync(tmp, JSON.stringify(state, null, 1), 'utf8');
-    fs.renameSync(tmp, chatFile(state.chatKey));
-  }, { waitMs: 5000 });
+  fs.mkdirSync(MESSAGES_DIR, { recursive: true });
+  const tmp = `${chatFile(state.chatKey)}.${process.pid}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(state, null, 1), 'utf8');
+  fs.renameSync(tmp, chatFile(state.chatKey));
 }
 
 export class ChatStore {
+  #writer;
   // maxPerChat/setMaxPerChat remain compatible with old startup code; no trimming.
   constructor(maxPerChat = 0) {
+    this.#writer = acquireArchiveWriter('messages');
     this.maxPerChat = Math.max(0, Number(maxPerChat) || 0);
     this.chats = new Map(); // chatKey -> state
   }
@@ -59,6 +59,8 @@ export class ChatStore {
   setMaxPerChat(cap) {
     this.maxPerChat = Math.max(0, Number(cap) || 0);
   }
+
+  close() { this.#writer.close(); }
 
   #state(chatKey) {
     if (!this.chats.has(chatKey)) this.chats.set(chatKey, loadChat(chatKey));
@@ -86,6 +88,7 @@ export class ChatStore {
 
   /** 追加一条收到的消息（未读）。返回写入的条目。 */
   appendIncoming(chatKey, { mid, ts, senderId, senderName, text, reply = null, media = [], mentions = [], commandText = null }) {
+    this.#writer.assertOpen();
     const st = this.#state(chatKey);
     // OneBot reconnects may replay a command. Keep its original handled state.
     if (commandText !== null && mid != null) {
@@ -114,6 +117,7 @@ export class ChatStore {
 
   /** 记录机器人自己发出的消息（已读）。 */
   appendSelf(chatKey, { text, ts, mid = null, media = [] }) {
+    this.#writer.assertOpen();
     const st = this.#state(chatKey);
     const entry = {
       id: st.nextLocalId++,
@@ -134,6 +138,7 @@ export class ChatStore {
 
   /** 快照当前未读并全部置为已读（运行开始时调用）。 */
   drainUnread(chatKey) {
+    this.#writer.assertOpen();
     const st = this.#state(chatKey);
     const unread = st.messages.filter((m) => !m.read && !m.self);
     for (const m of st.messages) m.read = true;
@@ -152,6 +157,7 @@ export class ChatStore {
    * @returns {number} 被标记为已读的条数
    */
   markAllRead(chatKey) {
+    this.#writer.assertOpen();
     const st = this.#state(chatKey);
     let n = 0;
     for (const m of st.messages) {
@@ -191,6 +197,7 @@ export class ChatStore {
   }
 
   acknowledge(chatKey, ids) {
+    this.#writer.assertOpen();
     const selected = new Set(ids);
     const st = this.#state(chatKey);
     for (const m of st.messages) if (selected.has(m.id)) m.read = true;
@@ -209,6 +216,7 @@ export class ChatStore {
    * —— 一次展开，以后谁（模型/存档页）都直接读到内容。
    */
   updateByMid(chatKey, mid, { text, appendMedia = [] } = {}) {
+    this.#writer.assertOpen();
     const st = this.#state(chatKey);
     const target = String(mid);
     const m = st.messages.find((x) => String(x.mid) === target);

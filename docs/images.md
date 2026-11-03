@@ -108,7 +108,7 @@ npm run images:storage -- --chat group:123456 --dry-run --json
 
 ### 显式执行清理
 
-确认预览后，同时传入 `--enable-cleanup --apply` 才会删除候选残留。两个开关缺一不可；`--dry-run --apply` 是错误参数组合，直接退出，不执行清理。
+确认预览并停止共享数据目录的所有应用进程后，同时传入 `--enable-cleanup --apply` 才会删除候选残留。运行期间仍可只读预览，但显式清理会被拒绝。两个开关缺一不可；`--dry-run --apply` 是错误参数组合，直接退出，不执行清理。
 
 ```bash
 # 仅清理指定会话中已经确认安全的残留
@@ -118,7 +118,11 @@ npm run images:storage -- --chat group:123456 --enable-cleanup --apply
 npm run images:storage -- --enable-cleanup --apply --json
 ```
 
-执行时会重新检查引用和文件状态，不使用先前的 dry-run 报告直接删除。图片发布、消息存档写入、会话日志持久化与清理共用数据目录下的 `image-storage.lock` 独占锁，防止把正在保存的资源当作残留。清理遇到已有锁时立即拒绝执行，正常写入最多等待 5 秒后报错。建议停止应用及其他共用该目录的进程后再维护；尤其应先停止不使用该锁的旧版本进程。崩溃留下的锁不会按时间自动过期或被自动抢占，应先确认相关进程已经退出、备份并检查数据后再人工处理。不要为了清理而删除聊天或会话存档来绕过引用保护。
+执行时会重新检查引用和文件状态，不使用先前的 dry-run 报告直接删除。清理现在**强制离线执行**：`ChatStore` 和 `SessionRegistry` 在构造时向 `archive-writers/` 登记写入者；登记与清理共用 `image-storage.lock`，避免启动和清理之间的竞态。清理发现任何登记，都会在扫描前返回阻断报告（`skipped: true`、退出码 2），不会删除文件，也不会把未扫描的零计数解释成实际占用。清理已经持锁时，新存储会在接收消息之前快速拒绝启动，待维护结束后再启动应用。
+
+普通消息存档、会话最终态、用量汇总以及会话删除不再等待图片维护锁，继续原子写入。因此维护锁争用不会阻塞事件循环五秒、丢弃入站消息，或把已确认的 QQ 投递误报为失败。图片发布仍使用原独占锁；完整图片、引用保护和跨会话隔离规则不变。
+
+登记在进程正常退出时释放；嵌入式调用者可在确认没有在途操作后显式调用存储实例的 `close()`，关闭后不能再通过该实例修改存档。不要仅因暂停机器人或调用停止连接就提前手工移除登记，进程内可能仍有在途操作。异常退出遗留的登记只阻止清理，不阻止新的应用启动和聊天落盘；不会按 PID 或时间自动过期。应先停止共享目录的所有进程，备份并检查存档/暂存状态，再人工处理遗留的 `archive-writers/` 登记或 `image-storage.lock`。旧版程序不使用登记协议，维护前同样必须停止。不要删除聊天或会话存档来绕过引用保护。
 
 重复执行不会损坏正常图片，也不会把已经删除的残留重复计入释放空间。退出码 `0` 表示命令正常完成，`1` 表示参数错误或操作失败，`2` 表示执行清理时存在阻断项；JSON 报告的 `removed` 和 `removedBytes` 是本次实际删除的文件及字节数。清理没有后台定时任务，也不改变原有 `imageId` 的读图、编辑和重发用法。
 
@@ -135,3 +139,5 @@ npm run images:storage -- --enable-cleanup --apply --json
 `npm run test:image-storage` 覆盖只读统计与 dry-run、显式启用、临时文件、孤儿元数据、跨会话引用与清理范围、重复清理，以及清理后历史读图和已有图片 ID 的复用。测试使用隔离目录，不清理真实图片。
 
 参考：[OpenCodex 仓库](https://github.com/lidge-jun/opencodex)、[OpenAI 官方 Images API 指南](https://developers.openai.com/api/docs/guides/image-generation)、[Images 编辑接口](https://developers.openai.com/api/reference/resources/images/methods/edit)。OpenAI 文档说明接口形态；本机订阅路径是否可用以本机转发实现和实测为准。
+
+`test/archive-writer-test.mjs` 使用真实子进程持锁 6.5 秒，验证入站消息、已确认的文字/图片投递、会话最终态与 token 汇总仍落盘；另覆盖离线清理门禁、维护先开始时拒绝新存储启动、正常/异常退出与关闭后禁止写入。

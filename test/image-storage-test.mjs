@@ -156,6 +156,7 @@ await check('完整聊天存档中的旧引用保护缺失二进制的元数据'
   const image = orphan(), store = new ChatStore(1);
   store.appendSelf('group:1', { mid: 1, text: `[图片:${image.imageId}]`, media: [{ kind: 'image', imageId: image.imageId }] });
   for (let i = 2; i <= 100; i++) store.appendSelf('group:1', { mid: i, text: `newer ${i}` });
+  store.close();
   const report = apply();
   assert.equal(report.references.complete, true);
   assert.equal(report.removed.length, 0);
@@ -166,6 +167,7 @@ await check('其他会话中的引用同样保护资源，不能借会话过滤�
   const image = orphan('group:1');
   const store = new ChatStore();
   store.appendSelf('private:1', { text: 'foreign diagnostic reference', media: [{ kind: 'image', imageId: image.imageId }] });
+  store.close();
   const report = apply({ chatKey: 'group:1' });
   assert.equal(report.removed.length, 0);
   assertKept(image);
@@ -216,7 +218,9 @@ await check('消息与会话的原子写入临时快照也是引用根', () => {
 await check('清理重新扫描引用，dry-run 后新增的记录使候选失效', () => {
   const image = orphan();
   assert.equal(scanImageStorage().summary.candidateFiles, 1);
-  new ChatStore().appendSelf('group:1', { text: `recovered reference ${image.imageId}` });
+  const store = new ChatStore();
+  store.appendSelf('group:1', { text: `recovered reference ${image.imageId}` });
+  store.close();
   const result = apply();
   assert.equal(result.removed.length, 0);
   assertKept(image);
@@ -286,7 +290,9 @@ await check('正式图片已保存时暂存清理失败仍返回可复用的 ID'
 
 await check('有引用的暂存事务保留，未知临时文件和额外内容不按扩展名清理', () => {
   const referenced = staging(), unknown = staging();
-  new ChatStore().appendSelf('group:1', { text: referenced.imageId });
+  const store = new ChatStore();
+  store.appendSelf('group:1', { text: referenced.imageId });
+  store.close();
   fs.writeFileSync(path.join(unknown.directory, 'do-not-delete.txt'), 'unexpected');
   fs.writeFileSync(path.join(root, 'legacy.tmp'), 'not application-owned');
   fs.mkdirSync(path.join(root, `${randomUUID()}.tmp`));
@@ -419,6 +425,7 @@ await check('现有维护锁不按年龄抢占；预览无写入，清理不触�
 await check('历史读图和重新导入在清理后仍复用同一个 imageId，并保持会话隔离', async () => {
   const image = saveImage('group:1', png, 'generated'), store = new ChatStore();
   store.appendSelf('group:1', { mid: 42, text: `[图片:${image.imageId}]`, media: [{ kind: 'image', imageId: image.imageId }] });
+  store.close();
   orphan();
   apply();
   const ctx = context('group:1', store);
@@ -434,7 +441,7 @@ await check('历史读图和重新导入在清理后仍复用同一个 imageId�
 });
 
 await check('发送失败后的资源经清理仍可用原 ID 重发，不触发生图', async () => {
-  const image = saveImage('private:1', png, 'generated'), store = new ChatStore();
+  const image = saveImage('private:1', png, 'generated'); let store = new ChatStore();
   let attempts = 0;
   const sender = new SendQueue({ store, onebot: {
     canReadLocalImageFiles: true,
@@ -450,7 +457,9 @@ await check('发送失败后的资源经清理仍可用原 ID 重发，不触发
   assert.equal(failed.isError, true);
   assert.ok(failed.content.includes(image.imageId));
   assert.equal(store.recent('private:1').length, 0);
+  store.close();
   assert.equal(apply().removed.length, 0);
+  store = new ChatStore(); sender.store = store; ctx.store = store;
   const retried = await tool('send_image').execute(ctx, { imageId: image.imageId });
   assert.ok(!retried.isError, retried.content);
   assert.equal(JSON.parse(retried.content).imageId, image.imageId);
@@ -458,7 +467,7 @@ await check('发送失败后的资源经清理仍可用原 ID 重发，不触发
   assert.equal(store.recent('private:1')[0].media[0].imageId, image.imageId);
 });
 
-await check('排队中和协议端尚在读取的本地图片在清理期间保留', async () => {
+await check('排队中和协议端尚在读取图片时拒绝在线清理，发送继续落盘', async () => {
   const first = saveImage('group:1', png, 'generated'), queued = saveImage('group:1', png, 'web');
   const store = new ChatStore();
   let release, entered;
@@ -481,7 +490,10 @@ await check('排队中和协议端尚在读取的本地图片在清理期间保�
     await waiting;
     assert.equal(calls, 1);
     assert.equal(store.recent('group:1').length, 0);
-    assert.equal(apply().removed.length, 0);
+    const report = apply();
+    assert.equal(report.removed.length, 0);
+    assert.equal(report.skipped, true);
+    assert.ok(report.blockers.some(b => b.path.startsWith('archive-writers/')));
     assert.deepEqual(loadImage('group:1', queued.imageId).buffer, png);
   } finally { release(); }
   await Promise.all([sending, pending]);

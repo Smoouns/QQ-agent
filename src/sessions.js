@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { DATA_DIR } from './config.js';
-import { withImageStorageLock } from './image-storage-lock.js';
+import { acquireArchiveWriter } from './archive-writer-lease.js';
 
 const SESSIONS_DIR = path.join(DATA_DIR, 'sessions');
 
@@ -17,18 +17,22 @@ export function sessionFile(id) {
 }
 
 export class SessionRegistry {
+  #writer;
   /**
    * @param {number} keepFiles 保留最近多少个会话记录文件；**0 = 不限制**。
    *   注意：不能用 `x || 300` 兜底 —— 0 是 falsy 会被误当成"未设置"变回 300，
    *   用户想"取消上限"就永远改不掉。也不能 Math.max(20,…) 强制下限。
    */
   constructor(keepFiles = 0) {
+    this.#writer = acquireArchiveWriter('sessions');
     this.keepFiles = Math.max(0, Number.isFinite(Number(keepFiles)) ? Math.round(Number(keepFiles)) : 0);
     this.index = [];   // [{ id, chatKey, startedAt, endedAt, status, outcome, usage, trigger, model, promptChars }]
     this.current = new Map(); // id -> session object（运行中的在内存里）
     fs.mkdirSync(SESSIONS_DIR, { recursive: true });
     this.#loadIndex();
   }
+
+  close() { this.#writer.close(); }
 
   #loadIndex() {
     try {
@@ -64,6 +68,7 @@ export class SessionRegistry {
   }
 
   create({ chatKey, trigger, triggerSummary, status = 'running', waitUntil = null }) {
+    this.#writer.assertOpen();
     const session = {
       id: newSessionId(),
       chatKey,
@@ -122,6 +127,7 @@ export class SessionRegistry {
   }
 
   update(id) {
+    this.#writer.assertOpen();
     const s = this.current.get(id);
     if (s) {
       this.#persistThrottled(s);
@@ -141,6 +147,7 @@ export class SessionRegistry {
   }
 
   finish(id, status) {
+    this.#writer.assertOpen();
     const s = this.current.get(id);
     if (!s) return null;
     s.status = status;
@@ -153,14 +160,12 @@ export class SessionRegistry {
     // 清理超出保留数的旧文件
     try {
       if (this.keepFiles > 0) {
-        withImageStorageLock(() => {
-          const files = fs.readdirSync(SESSIONS_DIR).filter((f) => f.endsWith('.json')).sort();
-          if (files.length > this.keepFiles) {
-            for (const f of files.slice(0, files.length - this.keepFiles)) {
-              try { fs.unlinkSync(path.join(SESSIONS_DIR, f)); } catch { /* ignore */ }
-            }
+        const files = fs.readdirSync(SESSIONS_DIR).filter((f) => f.endsWith('.json')).sort();
+        if (files.length > this.keepFiles) {
+          for (const f of files.slice(0, files.length - this.keepFiles)) {
+            try { fs.unlinkSync(path.join(SESSIONS_DIR, f)); } catch { /* ignore */ }
           }
-        }, { waitMs: 5000 });
+        }
       }
     } catch { /* ignore */ }
     return s;
@@ -178,6 +183,7 @@ export class SessionRegistry {
    *    已经跑过并消耗了 token 的会话要走 finish，别用这个抹掉用量记录。
    */
   discard(id) {
+    this.#writer.assertOpen();
     if (!id) return false;
     const s = this.current.get(id);
     // 已运行过的不允许丢弃（会抹掉用量/成本记录，导致对不上账）
@@ -186,10 +192,8 @@ export class SessionRegistry {
     const before = this.index.length;
     this.index = this.index.filter((e) => e.id !== id);
     try {
-      withImageStorageLock(() => {
-        const f = path.join(SESSIONS_DIR, `${id}.json`);
-        if (fs.existsSync(f)) fs.unlinkSync(f);
-      }, { waitMs: 5000 });
+      const f = path.join(SESSIONS_DIR, `${id}.json`);
+      if (fs.existsSync(f)) fs.unlinkSync(f);
     } catch { /* ignore */ }
     return this.index.length < before;
   }
@@ -270,12 +274,10 @@ export class SessionRegistry {
 
   #persist(s) {
     try {
-      withImageStorageLock(() => {
-        fs.mkdirSync(SESSIONS_DIR, { recursive: true });
-        const tmp = `${sessionFile(s.id)}.${process.pid}.tmp`;
-        fs.writeFileSync(tmp, JSON.stringify(s, null, 1), 'utf8');
-        fs.renameSync(tmp, sessionFile(s.id));
-      }, { waitMs: 5000 });
+      fs.mkdirSync(SESSIONS_DIR, { recursive: true });
+      const tmp = `${sessionFile(s.id)}.${process.pid}.tmp`;
+      fs.writeFileSync(tmp, JSON.stringify(s, null, 1), 'utf8');
+      fs.renameSync(tmp, sessionFile(s.id));
       if (s.status !== 'running' && s.status !== 'waiting') this.#bumpTodayUsage(s);
     } catch (error) {
       console.error('[sessions] 持久化失败:', error?.message ?? error);

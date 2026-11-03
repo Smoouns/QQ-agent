@@ -5,6 +5,7 @@ import { assertImageChat } from './image-config.js';
 import { scanImageReferences } from './image-references.js';
 import { IMAGE_ASSET_DIR as root, IMAGE_ID_RE, IMAGE_STAGING_FORMAT, MAX_IMAGE_BYTES, readRegularFile, sameFile } from './image-asset-files.js';
 import { IMAGE_STORAGE_LOCK, withImageStorageLock } from './image-storage-lock.js';
+import { archiveWriterBlockers } from './archive-writer-lease.js';
 
 const UUIDS = /[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}/gi;
 const MIMES = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp']);
@@ -30,8 +31,10 @@ function fileRecord(name, stat, type) {
 
 function inspect(chatKey, locked = false) {
   if (chatKey !== undefined && !validChat(chatKey)) throw new Error('图片清理的会话标识无效');
-  const refs = scanImageReferences();
-  const blockers = [...refs.issues];
+  const writers = archiveWriterBlockers();
+  const skip = locked && writers.length > 0;
+  const refs = skip ? { issues: [], imageIds: new Set(), references: new Map(), complete: false } : scanImageReferences();
+  const blockers = [...refs.issues, ...writers];
   const report = {
     dryRun: true, scope: chatKey ?? null,
     totals: { files: 0, bytes: 0, completeImages: 0, imageBytes: 0, metadataBytes: 0, temporaryBytes: 0, otherBytes: 0, unscannedDirectories: 0 },
@@ -40,6 +43,14 @@ function inspect(chatKey, locked = false) {
     references: { complete: refs.complete, imageCount: refs.imageIds.size, issues: refs.issues }
   };
   const candidates = [], entries = [], groups = new Map();
+  // Refuse online cleanup BEFORE the potentially long archive scan. This also
+  // lets a second store register promptly while an application is starting.
+  if (skip) {
+    report.skipped = true;
+    report.references.complete = false;
+    report.references.issues = [...blockers];
+    return { report, candidates, rootStat: undefined };
+  }
   const checkLock = () => {
     if (locked) return;
     try {
