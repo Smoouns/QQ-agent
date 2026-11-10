@@ -694,7 +694,7 @@ export class Orchestrator {
       if (!this.#chatAllowed(chatKey)) throw new Error('当前会话已失去接入资格');
       if (tierInfo?.manualReply) this.#assertManualReplyAllowed(chatKey);
     };
-    let finish = false;
+    let modelTermination = null;
     let webSearchCount = 0;
     session.activity = '';
     session.webSearchCount = 0;
@@ -703,7 +703,7 @@ export class Orchestrator {
       this.sessions.update(session.id);
       this.emit('session-update', session.id);
     };
-    for (let round = 0; round < maxRounds && !finish; round++) {
+    for (let round = 0; round < maxRounds && !modelTermination; round++) {
       if (this.aborted) { this.sessions.finish(session.id, 'aborted'); return false; }
       assertContextAllowed(session, this.memory, chatKey);
       stopReason = budget.stopReason(session.usage) || (modelAttempts >= maxRounds ? 'model_budget' : null);
@@ -799,7 +799,7 @@ export class Orchestrator {
       }
       if (!toolCalls.length) {
         // 没有工具调用 = 模型结束思考（文本不会发给 QQ）
-        stopReason = budget.stopReason(session.usage) || (modelAttempts >= maxRounds ? 'model_budget' : null);
+        modelTermination = 'model_stop';
         break;
       }
 
@@ -862,7 +862,7 @@ export class Orchestrator {
         }
         this.sessions.update(session.id);
         this.emit('session-update', session.id);
-        if (name === 'finish' && !blocked && !result.isError) finish = true;
+        if (name === 'finish' && !blocked && !result.isError) modelTermination = 'model_finish';
       }
       messages.push(...toolResults.map(({ role, tool_call_id, name, content }) => ({ role, tool_call_id, content, name })));
       // 图片消息跟随在全部 tool 结果之后（OpenAI 校验要求每个 tool_call 都有对应 tool 消息）
@@ -870,9 +870,11 @@ export class Orchestrator {
       // 给 UI 的简化消息流（跳过纯 tool 结果的重复展示）
     }
 
-    stopReason ||= budget.stopReason(session.usage) || (modelAttempts >= maxRounds ? 'model_budget' : null);
+    // Completing the last admitted request/tool is still a natural end. Only a
+    // run that needs to continue can be forced to stop by an exhausted budget.
+    if (!modelTermination) stopReason ||= budget.stopReason(session.usage) || (modelAttempts >= maxRounds ? 'model_budget' : null);
     saveBudget();
-    session.terminationReason = stopReason || (finish ? 'model_finish' : 'model_stop');
+    session.terminationReason = modelTermination || stopReason || 'model_stop';
     if (stopReason && !session.sent.length) {
       await finalizeRun({ messages, session, availableDefs, ctx, assertActive, markActivity,
         completion, reason: stopReason, maxChars: budget.limits.toolResultMaxChars, parseInlineToolCalls });
