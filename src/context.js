@@ -1,6 +1,7 @@
 // Read-only context selection. Archive retention and model context are independent.
 import { getConfig } from './config.js';
 import { memoryVisible, memoryEvidenceIssue } from './memory.js';
+import { sharedPersonalProfile } from './memory-profile.js';
 
 export function blockedIds(chatKey) {
   const [kind, id] = chatKey.split(':');
@@ -10,8 +11,10 @@ export function messageAllowed(m, chatKey) {
   const blocked = blockedIds(chatKey);
   return (m.self || !blocked.has(String(m.senderId))) && !blocked.has(String(m.reply?.senderId || ''));
 }
-export function recordAllowed(r, chatKey, { historical = false } = {}) {
-  if (!r || !memoryVisible(r, chatKey) || r.status === 'deleted') return false;
+export function recordAllowed(r, chatKey, { historical = false, personId = '' } = {}) {
+  if (!r || r.status === 'deleted') return false;
+  // Only an explicit person lookup supplies personId. Ordinary recall remains scoped.
+  if (personId ? !r.subjectIds.includes(personId) : !memoryVisible(r, chatKey)) return false;
   if (memoryEvidenceIssue(r)) return false;
   if (!historical && (['superseded', 'expired'].includes(r.status) || (r.expiresAt && r.expiresAt <= Date.now()))) return false;
   const blocked = blockedIds(chatKey);
@@ -100,7 +103,7 @@ export function recallMemories(memory, chatKey, { query = '', secondary = '', su
     const person = record.subjectIds.some((id) => subjects.has(id));
     const topic = direct > 0 || (recent > 0 && (person || primary.length === 0));
     const profile = person && ['fact', 'preference', 'interaction', 'relationship'].includes(record.kind) &&
-      (topic || record.kind === 'interaction' || /称呼|叫我|名字|昵称/.test(record.content));
+      (topic || sharedPersonalProfile(record) || record.kind === 'interaction' || /称呼|叫我|名字|昵称/.test(record.content));
     const score = direct * 100 + Math.min(recent, 4) * 10 + (person ? 5 : 0) +
       (topic && ['pending', 'in_progress'].includes(record.status) ? 2 : 0) + (record.pinned ? 1 : 0);
     return { record, profile, topic, score, reason: [direct ? '新消息词项' : '', recent ? '近期话题' : '', person ? '当前人物' : '', profile && !topic ? '称呼或相处习惯' : ''].filter(Boolean).join('、') };
@@ -122,13 +125,13 @@ export function recallMemories(memory, chatKey, { query = '', secondary = '', su
 
 export function memoryText(selected) {
   const labels = { explicit: '本人明确表达', reported: '他人转述', inferred: '推测，待核实', legacy: '旧印象，缺少原始证据', admin: '管理员确认' };
-  return selected.map(({ record: r }) => `- [${r.id} v${r.version} | ${r.kind} | ${r.status} | ${labels[r.evidence]}] 主体=${r.subjectIds.join(',')}；${r.title ? `${r.title}：` : ''}${r.content}`).join('\n');
+  return selected.map(({ record: r }) => `- [${r.id} v${r.version} | ${r.kind} | ${r.status} | ${labels[r.evidence]}${sharedPersonalProfile(r) ? ' | 共享个人资料' : ''}] 主体=${r.subjectIds.join(',')}；${r.title ? `${r.title}：` : ''}${r.content}`).join('\n');
 }
 
-export function rememberAccess(session, records) {
+export function rememberAccess(session, records, { personId = '' } = {}) {
   session.memoryAccess ||= [];
-  for (const r of records) if (!session.memoryAccess.some((x) => x.id === r.id && x.version === r.version)) {
-    session.memoryAccess.push({ id: r.id, version: r.version });
+  for (const r of records) if (!session.memoryAccess.some((x) => x.id === r.id && x.version === r.version && (x.personId || '') === personId)) {
+    session.memoryAccess.push({ id: r.id, version: r.version, ...(personId ? { personId } : {}) });
   }
 }
 export function assertContextAllowed(session, memory, chatKey) {
@@ -137,8 +140,8 @@ export function assertContextAllowed(session, memory, chatKey) {
   if (fingerprint !== session.contextSelection.blocklist) throw new Error('上下文可见范围已改变，本次运行停止，请重新唤醒');
   for (const ref of session.memoryAccess || []) {
     const current = memory.getRecord(ref.id);
-    if (!recordAllowed(current, chatKey)) throw new Error('已使用的记忆被删除、失效或收紧范围，本次运行停止');
+    if (!recordAllowed(current, chatKey, { personId: ref.personId || '' })) throw new Error('已使用的记忆被删除、失效或收紧范围，本次运行停止');
     const used = current.version === ref.version ? current : current.history.find((r) => r.version === ref.version);
-    if (!recordAllowed(used, chatKey, { historical: true })) throw new Error('已使用的历史记忆不再可见，本次运行停止');
+    if (!recordAllowed(used, chatKey, { historical: true, personId: ref.personId || '' })) throw new Error('已使用的历史记忆不再可见，本次运行停止');
   }
 }

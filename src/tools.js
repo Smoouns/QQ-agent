@@ -16,6 +16,9 @@ import { expandForwardNodes } from './onebot.js';
 import { createComputerStatusTool } from './computer-status.js';
 import { imageTools } from './image-tools.js';
 import { imageMime, loadImage, MAX_IMAGE_BYTES } from './image-assets.js';
+import { normalizeRunLimits } from './run-budget.js';
+import { memoryPage, memoryDetail } from './memory-output.js';
+import { createUsageQueryTool } from './usage-query.js';
 
 async function downloadImageAsDataUrl(url) {
   // safeFetchBinary 已执行逐跳 URL/DNS 校验，不再提前解析同一域名第二次。
@@ -36,6 +39,28 @@ function ok(payload) {
 
 function err(message) {
   return { content: `错误：${message}`, isError: true };
+}
+
+function personMemoryText(record) {
+  const evidence = { reported: '他人转述', inferred: '推测，待核实', legacy: '旧记忆，缺少原始证据' }[record.evidence];
+  const status = { pending: '待完成', in_progress: '进行中', completed: '已完成', cancelled: '已取消' }[record.status];
+  const title = record.title && !record.content.includes(record.title) ? `${record.title}：` : '';
+  return `${evidence ? `[${evidence}] ` : ''}${status ? `[${status}] ` : ''}${title}${record.content}`;
+}
+
+function uniquePersonMemories(records) {
+  const seen = new Set();
+  return records.filter((r) => {
+    // Do not collapse different events/subjects just because their short text matches.
+    const key = JSON.stringify([r.content, r.evidence, r.status, r.kind, r.title || '', [...r.subjectIds].sort(), r.eventId || '']);
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function memoryMaxChars(ctx) {
+  return normalizeRunLimits({ toolResultMaxChars: ctx.toolResultMaxChars ?? getConfig().runLimits?.toolResultMaxChars }).toolResultMaxChars;
 }
 
 // One roster snapshot per run: no full roster in persisted sessions or prompts.
@@ -115,6 +140,7 @@ export function buildToolDefs() {
   return [
     ...imageTools(),
     createComputerStatusTool(),
+    createUsageQueryTool(),
     {
       name: 'send_message',
       description: '发送消息到当前聊天（本工具只能发到本次会话对应的群/私聊）。messages 传字符串=发一条；传字符串数组=分多条发送（推荐，更像真人）。只有需要明确"我回的是哪条"时才传 replyToMessageId 引用；需要点名某人才传 atUserId。不要在字符串内部用空格分句。',
@@ -489,7 +515,7 @@ export function buildToolDefs() {
     },
     {
       name: 'memory_append',
-      description: '保存事实、偏好、关系、共同事件或承诺，或按 targetId/targetVersion 更新已有记录。必须准确区分说话人与主体；多人事件只写一份。sourceMessageIds 填原始 QQ 消息 ID。记录仅限当前会话，固定记忆不可修改。所有写入必须提供来源；机器人主体只记事件或承诺，用户事实需要用户消息依据。',
+      description: '保存记忆或按 targetId/targetVersion 更新当前来源会话的记录，固定记忆不可修改。sourceMessageIds 填原始 QQ 消息 ID，必须准确区分说话人与主体。默认保持会话范围；群聊本人明确表达的稳定称呼、兴趣和交流习惯可标记 profileCategory 跨会话共享。私聊、具体经历、敏感信息和转述不共享。机器人主体只记事件或承诺。',
       parameters: {
         type: 'object',
         properties: {
@@ -497,6 +523,7 @@ export function buildToolDefs() {
           userId: { type: ['integer', 'string'], description: '对方 QQ 号（数字）' },
           target: { type: 'string', description: '对方名字（备注名/群名片/昵称）' },
           kind: { type: 'string', enum: ['fact', 'preference', 'interaction', 'relationship', 'event', 'commitment'] },
+          profileCategory: { type: 'string', enum: ['', 'nickname', 'interest', 'communication'], description: '可选稳定个人资料：nickname 称呼（fact/interaction）、interest 长期兴趣（preference）、communication 交流习惯（interaction/preference）。仅群聊本人原话、单人、active、无期限/事件/敏感内容；不确定、私聊或具体经历留空。更新须重新判断。' },
           subjectIds: { type: 'array', items: { type: 'string' }, description: '涉及的 QQ 号，多人事件可填写多个；机器人用 bot' },
           sourceMessageIds: { type: 'array', items: { type: ['integer', 'string'] }, description: '原始 QQ 消息 ID（聊天记录 #数字）' },
           evidence: { type: 'string', enum: ['explicit', 'reported', 'inferred'] },
@@ -526,6 +553,41 @@ export function buildToolDefs() {
       }
     },
     {
+      name: 'memory_person_query',
+      description: '按真实 QQ 号查询某个人跨所有群聊、私聊的有效记忆。默认返回去重后的正文数组 memories，仅标记转述、推测、缺少证据及事件进度；无需话题匹配。需定位或修改记录时设 detail=true 获取 records（ID、类型、证据、版本等，保留重复记录）。按更新时间倒序分页，将非 null 的 nextOffset 作为下一页 offset；切换 detail 时从 offset=0 重新查。过滤已删除、过期、被替代及屏蔽记录，不返回来源原文。',
+      parameters: {
+        type: 'object',
+        properties: {
+          userId: { type: ['integer', 'string'], description: '要查询的个人 QQ 号，不能填昵称或 bot' },
+          limit: { type: 'integer', minimum: 1, maximum: 50, description: '每页条数，默认 10，最大 50' },
+          offset: { type: 'integer', minimum: 0, description: '默认 0；继续查询时传返回的 nextOffset' },
+          detail: { type: 'boolean', description: '默认 false：只读简洁正文；true：返回定位、编辑所需字段，保留重复记录' }
+        },
+        required: ['userId'],
+        additionalProperties: false
+      },
+      async execute(ctx, args) {
+        const userId = String(args.userId ?? '').trim();
+        if (!['string', 'number'].includes(typeof args.userId) || !/^[1-9]\d{0,14}$/.test(userId)) return err('userId 必须是有效的数字 QQ 号，不能使用昵称');
+        const limit = args.limit ?? 10, offset = args.offset ?? 0;
+        if (args.detail !== undefined && typeof args.detail !== 'boolean') return err('detail 必须是布尔值');
+        if (!Number.isInteger(limit) || limit < 1 || limit > 50) return err('limit 必须是 1–50 的整数');
+        if (!Number.isSafeInteger(offset) || offset < 0) return err('offset 必须是非负安全整数');
+        assertContextAllowed(ctx.session, ctx.memory, ctx.chatKey);
+        const personId = `qq:${userId}`;
+        const visible = ctx.memory.listRecords({ personId: userId })
+          .filter((r) => recordAllowed(r, ctx.chatKey, { personId }))
+          .sort((a, b) => b.updatedAt - a.updatedAt || a.id.localeCompare(b.id));
+        const rows = args.detail ? visible : uniquePersonMemories(visible);
+        const format = args.detail ? ({ id, kind, content, subjectIds, status, version, pinned, title, evidence, eventId }) =>
+          ({ id, kind, content, status, version, evidence, ...(subjectIds.length > 1 ? { subjectIds } : {}),
+            ...(title ? { title } : {}), ...(eventId ? { eventId } : {}), ...(pinned ? { pinned } : {}) }) : personMemoryText;
+        const page = memoryPage(rows, { offset, limit, maxChars: memoryMaxChars(ctx), key: args.detail ? 'records' : 'memories', format });
+        rememberAccess(ctx.session, page.selected, { personId });
+        return page.result;
+      }
+    },
+    {
       name: 'memory_query',
       description: '搜索当前会话可见的记忆。用 query 按话题检索、userId 按 QQ 人物筛选、eventId 查关联记录；用 recordId 展开详情和本会话原始证据，includeHistory 可查看仍可见的旧版本。不搜索其他会话的专属内容。',
       parameters: {
@@ -536,24 +598,28 @@ export function buildToolDefs() {
           recordId: { type: 'string', description: '展开指定记忆' },
           eventId: { type: 'string', description: '查这个事件及其关联记录' },
           includeHistory: { type: 'boolean', description: '展开详情时附上可见的旧版本' },
-          limit: { type: 'integer', description: '默认 20，最大 50' }
+          limit: { type: 'integer', description: '默认 20，最大 50；还受工具文字上限限制' },
+          offset: { type: 'integer', minimum: 0, description: '列表分页偏移，默认 0，后续传 nextOffset；详情模式不使用' }
         }
       },
       async execute(ctx, args) {
         const userId = String(args.userId ?? '').trim();
         if (userId && !/^\d{1,15}$/.test(userId)) return err('userId 必须是 QQ 号');
         const limit = Math.min(50, Math.max(1, Number(args.limit) || 20));
+        const offset = args.offset ?? 0;
+        if (!Number.isSafeInteger(offset) || offset < 0) return err('offset 必须是非负安全整数');
         const publicRecord = (r) => {
           const { id, kind, content, subjectIds, status, version, pinned, title, evidence, eventId, updatedAt } = r;
-          return { id, kind, content, subjectIds, status, version, pinned, title, evidence, eventId, updatedAt };
+          return { id, kind, content, subjectIds, status, version, pinned, title, evidence, eventId, updatedAt, profileCategory: r.profileCategory || '' };
         };
         if (args.recordId) {
           const r = ctx.memory.getRecord(String(args.recordId));
           if (!recordAllowed(r, ctx.chatKey)) return err('当前会话找不到可见的有效记忆');
           const versions = args.includeHistory ? r.history.filter((v) => recordAllowed(v, ctx.chatKey, { historical: true })) : [];
-          rememberAccess(ctx.session, [r, ...versions]);
           const sources = (v) => (v.sources || []).filter((src) => src.chatKey === ctx.chatKey && messageAllowed({ senderId: src.senderId }, ctx.chatKey));
-          return ok({ record: { ...publicRecord(r), sources: sources(r), history: versions.map((v) => ({ ...publicRecord(v), sources: sources(v) })) } });
+          const result = memoryDetail({ record: { ...publicRecord(r), sources: sources(r), history: versions.map((v) => ({ ...publicRecord(v), sources: sources(v) })) } }, memoryMaxChars(ctx));
+          if (!result.isError) rememberAccess(ctx.session, [r, ...versions]);
+          return result;
         }
         let records = ctx.memory.listRecords({ chatKey: ctx.chatKey, personId: userId }).filter((r) => recordAllowed(r, ctx.chatKey));
         if (args.eventId) {
@@ -562,12 +628,13 @@ export function buildToolDefs() {
           records = records.filter((r) => r.id === event.id || r.eventId === event.id);
         }
         if (String(args.query || '').trim()) {
-          const selected = recallMemories({ listRecords: () => records }, ctx.chatKey, { query: args.query, limit, personLimit: 0, topicLimit: limit });
+          const selected = recallMemories({ listRecords: () => records }, ctx.chatKey, { query: args.query, limit: records.length, personLimit: 0, topicLimit: records.length });
           records = selected.map((x) => x.record);
         }
-        records = records.slice(0, limit);
-        rememberAccess(ctx.session, records);
-        return ok({ records: records.map(publicRecord), memberImpression: records.filter((r) => r.kind === 'fact').map((r) => ({ id: r.id, userId: r.subjectIds[0]?.replace(/^qq:/, ''), content: r.content })) });
+        const page = memoryPage(records, { offset, limit, maxChars: memoryMaxChars(ctx), key: 'records', format: publicRecord,
+          extras: rows => ({ memberImpression: rows.filter(r => r.kind === 'fact').map(r => ({ id: r.id, userId: r.subjectIds[0]?.replace(/^qq:/, ''), content: r.content })) }) });
+        rememberAccess(ctx.session, page.selected);
+        return page.result;
       }
     },
     {

@@ -1,14 +1,15 @@
 import { chatCompletion, addUsage, emptyUsage } from './llm.js';
 import { executeTool, toOpenAiTools } from './tools.js';
 import { COMPLETION_LIMITS, COMPLETION_TOOLS, boundedToolText } from './run-budget.js';
+import { fitFinalizationContext, assertRequestContext } from './request-context.js';
 
 // No HTTP retries and no whole-run replay. All effects use the normal permission
 // dispatcher; only explicitly listed tools receive a reserved execution slot.
 export async function finalizeRun({ messages, session, availableDefs, ctx, assertActive, markActivity,
-  completion, reason, maxChars, parseInlineToolCalls }) {
+  completion, reason, maxChars, contextLimits, parseInlineToolCalls }) {
   const defs = availableDefs.filter(d => COMPLETION_TOOLS.has(d.name)).sort((a, b) => a.name.localeCompare(b.name));
   const deliveryCtx = { ...ctx, assertRunAllowed: assertActive };
-  session.finalization = { attempted: true, reason, sent: false, modelAttempts: 0, ...completion.snapshot() };
+  session.finalization = { attempted: true, reason, sent: false, modelAttempts: 0, contextChecks: [], ...completion.snapshot() };
   const update = () => {
     Object.assign(session.finalization, completion.snapshot(), { sent: session.sent.length > 0 });
     markActivity(session.sent.length ? '' : '收尾：确认已有图片或交付结果…');
@@ -30,9 +31,13 @@ export async function finalizeRun({ messages, session, availableDefs, ctx, asser
     assertActive();
     messages.push({ role: 'system', content: instruction });
     session.messages.push({ budgetNotice: instruction, requestPhase: 'finalization' });
+    const fitted = fitFinalizationContext(messages, tools, contextLimits);
+    session.finalization.contextChecks.push({ before: fitted.before, after: fitted.after, removed: fitted.removed });
+    assertRequestContext(fitted.messages, tools, contextLimits);
+    messages.splice(0, messages.length, ...fitted.messages);
     session.finalization.modelAttempts++;
     update();
-    const response = await chatCompletion({ messages, tools });
+    const response = await chatCompletion({ messages, tools, contextLimits });
     const phase = session.usageByPhase.finalization ||= emptyUsage();
     addUsage(phase, response.usage); phase.calls++;
     addUsage(session.usage, response.usage); session.usage.calls++; session.rounds++;

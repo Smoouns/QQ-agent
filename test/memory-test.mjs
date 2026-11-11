@@ -148,13 +148,18 @@ await check('模型失败保留游标，恢复后写入，重启不重抽', asyn
 });
 await check('模型返回坏 JSON 时用量仍留存，后续成功不会清空累计用量', async () => {
   const m = new MemoryStore(path.join(DATA_DIR, 'usage-fixture'));
-  const p = new MemoryPipeline({ store, memory: m, runModel: async () => ({ usage: { prompt_tokens: 10, completion_tokens: 5 }, message: { content: '{}' } }) });
+  const p = new MemoryPipeline({ store, memory: m, runModel: async () => ({ usage: { prompt_tokens: 10, completion_tokens: 5 },
+    model: 'memory-model', usageMeta: { at: 1234567890000, vendor: 'memory-provider' }, message: { content: '{}' } }) });
   await assert.rejects(p.run('group:1'));
   assert.equal(m.job('group:1').cursor, 0);
   assert.equal(m.job('group:1').usage.totalTokens, 15);
+  assert.equal(m.usageLedger().calls[0].at, 1234567890000);
+  assert.equal(m.usageLedger().calls[0].model, 'memory-model');
+  assert.equal(m.usageLedger().calls[0].vendor, 'memory-provider');
   p.runModel = async () => ({ usage: { prompt_tokens: 8, completion_tokens: 2 }, message: { content: '{"memories":[]}' } });
   await p.run('group:1');
   assert.equal(m.job('group:1').usage.calls, 2); assert.equal(m.job('group:1').usage.totalTokens, 25);
+  assert.equal(m.usageLedger().calls.length, 2);
   p.stop();
 });
 await check('批处理中新增消息不会被提前标记处理，同会话并发只调用一次模型', async () => {

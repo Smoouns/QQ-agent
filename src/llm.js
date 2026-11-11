@@ -2,6 +2,7 @@
 // 支持工具调用、usage 统计、可自选模型 —— 这是与 DSH 解耦后的"大脑"接口。
 import { getConfig } from './config.js';
 import { resolveOfficialPrice, resolveModelPrice, priceAt } from './model-prices.js';
+import { assertRequestContext } from './request-context.js';
 
 function joinUrl(base, path) {
   return `${String(base).replace(/\/+$/, '')}${path}`;
@@ -132,7 +133,8 @@ export async function chatCompletionWithRetry(args, retries = 2) {
  * 返回 { message, usage, raw }；usage 形如 { prompt_tokens, completion_tokens, total_tokens }。
  * overrides: { baseUrl, apiKey, model, timeoutMs } 可选，用于记忆整理专用模型等场景。
  */
-export async function chatCompletion({ messages, tools = null, toolChoice = 'auto', temperature = null, signal = null, overrides = null }) {
+export async function chatCompletion({ messages, tools = null, toolChoice = 'auto', temperature = null, signal = null, overrides = null, contextLimits = null }) {
+  assertRequestContext(messages, tools, contextLimits || getConfig().runLimits);
   const api = overrides || effectiveApi();
   const body = {
     model: api.model,

@@ -1,4 +1,4 @@
-import { searchUsageCalls } from './search-usage.js';
+import { sessionUsageRows, usagePrice } from './usage-query.js';
 // 总装：OneBot 事件接入 → 存储 → 编排器；HTTP API + SSE 给 UI。
 // Electron 主进程与 headless 服务器都从这里启动。
 import http from 'node:http';
@@ -20,8 +20,8 @@ import { SessionRegistry } from './sessions.js';
 import { Orchestrator } from './orchestrator.js';
 import { directCommandText, normalizePermissions } from './permissions.js';
 import { McpManager, publicMcpServer } from './mcp.js';
-import { listModels, chatCompletion, resolveApiKey, estimateCost, cacheHitRate, addUsage, emptyUsage, cacheCoverage, CACHE_COUNTERS } from './llm.js';
-import { resolveOfficialPrice, listOfficialPrices, isPeakHour, priceAt, resolveModelPrice, modelLabel, splitModelLabel, UNKNOWN_VENDOR } from './model-prices.js';
+import { listModels, chatCompletion, resolveApiKey, estimateCost, cacheHitRate, cacheCoverage, CACHE_COUNTERS } from './llm.js';
+import { resolveOfficialPrice, listOfficialPrices, isPeakHour, priceAt, modelLabel, splitModelLabel, UNKNOWN_VENDOR } from './model-prices.js';
 import { initPriceFeed, refreshPriceFeed, priceFeedStatus } from './price-feed.js';
 import { currentProviders, setProviderKey, testAllProviders, testOneProvider, testModelChat, fetchModelsFrom, upsertProvider, addModelsToProvider, removeModelFromProvider } from './providers.js';
 import { scanModelsVision, visionResults, modelImageVerdict } from './vision-scan.js';
@@ -716,6 +716,7 @@ export function createApp({ log = console.log } = {}) {
       if (pathname.startsWith('/api/memory/')) {
         try {
           if (pathname === '/api/memory/persons' && method === 'GET') return json(res, 200, { persons: memory.listPersons() });
+          if (pathname === '/api/memory/profile-migration' && method === 'GET') return json(res, 200, { migration: memory.profileMigration() });
           const personMatch = /^\/api\/memory\/persons\/([^/]+)$/.exec(pathname);
           if (personMatch && method === 'GET') {
             const person = memory.getPerson(decodeURIComponent(personMatch[1]));
@@ -1778,61 +1779,13 @@ function collectUsageRows({ range }) {
       }
     }
 
-    for (const call of searchUsageCalls(s)) {
-      const at = call.at || started;
-      if (at < win.start || at > win.end) continue;
-      const row = { ...call.usage, at, model: call.model || '(未知)', vendor: call.provider || '(未知)',
-        chatKey: s.chatKey, sessionId: s.id, exact: true, usageReported: call.usageReported };
-      row.modelKey = modelLabel(row.vendor, row.model); searchRows.push(row);
+    const expanded = sessionUsageRows(s);
+    for (const row of expanded.search) {
+      if (row.at < win.start || row.at > win.end) continue;
+      row.modelKey = modelLabel(row.vendor, row.model);
+      searchRows.push(row);
     }
-    // 逐次调用展开：每条 message.raw 有独立的 usage / created / model
-    const calls = [];
-    let callIndex = 0;
-    for (const m of (s.messages || [])) {
-      const raw = m?.raw;
-      if (!raw || typeof raw !== 'object' || m.role !== 'assistant') continue;
-      const phase = m.requestPhase === 'finalization' ? 'finalization' : callIndex === 0 ? 'first' : 'continuation';
-      callIndex++;
-      const ru = raw.usage || {};
-      const rp = Number(ru.prompt_tokens) || 0;
-      const rc = Number(ru.completion_tokens) || 0;
-      const at = Number(raw.created) ? Number(raw.created) * 1000 : started;
-      calls.push({
-        promptTokens: rp,
-        completionTokens: rc,
-        ...addUsage(emptyUsage(), ru),
-        phase,
-        at,
-        model: String(raw.model || s.model || '') || '(未知)'
-      });
-    }
-
-    if (calls.length) {
-      for (const c of calls) {
-        if (c.at < win.start || c.at > win.end) continue;
-        rows.push({ ...c, vendor: String(s.vendor || ''), chatKey: String(s.chatKey || '(未知)'), sessionId: s.id, exact: true });
-      }
-    } else {
-      const u = s.usage || {};
-      const p = Number(u.promptTokens) || 0;
-      const c = Number(u.completionTokens) || 0;
-      if (!p && !c) continue;
-      if (started < win.start || started > win.end) continue;
-      rows.push({
-        promptTokens: p,
-        completionTokens: c,
-        cachedTokens: Number(u.cachedTokens) || 0,
-        ...cacheCoverage(u),
-        cacheUnreportedCalls: u.cacheUnreportedCalls ?? (u.cacheReportedCalls == null ? Math.max(1, Number(u.calls) || 0) : 0),
-        phase: 'unknown',
-        at: started,
-        model: String(s.model || '') || '(未知)',
-        chatKey: String(s.chatKey || '(未知)'),
-        vendor: String(s.vendor || ''),
-        sessionId: s.id,
-        exact: false
-      });
-    }
+    rows.push(...expanded.chat.filter((row) => row.at >= win.start && row.at <= win.end));
   }
   // 模型身份 = 渠道 + 模型 id。
   // 渠道取**会话自己记录的** vendor（创建会话时由当时的配置派生）。
@@ -1865,13 +1818,7 @@ function collectUsageRows({ range }) {
  * ⚠️ 必须与前端展示/批量编辑用的身份一致，否则用户设的渠道价永远不会生效。
  */
 function priceOf(model, vendor) {
-  const cfg = getConfig();
-  if (vendor) {
-    const byVendor = resolveModelPrice(modelLabel(vendor, model), cfg);
-    // 命中自定义价才算数；否则退回通用价（避免渠道名干扰官方表匹配）
-    if (byVendor.source === 'custom') return byVendor;
-  }
-  return resolveModelPrice(model, cfg);
+  return usagePrice(model, vendor);
 }
 
 /** 对一批行计价，返回总额与峰谷拆分。 */

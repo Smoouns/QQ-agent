@@ -3,7 +3,9 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import { addUsage, emptyUsage } from './llm.js';
 import { DATA_DIR, getConfig, updateConfig } from './config.js';
+import { PROFILE_CATEGORIES, profileSharingIssue, sharedPersonalProfile, legacyProfileCategory } from './memory-profile.js';
 
 export const MEMORY_KINDS = ['fact', 'preference', 'interaction', 'relationship', 'event', 'commitment'];
 export const MEMORY_STATUSES = ['active', 'pending', 'in_progress', 'completed', 'cancelled', 'superseded', 'expired', 'deleted'];
@@ -40,7 +42,7 @@ function visibility(v) {
   if (v?.type !== 'chats' || !Array.isArray(v.chatKeys) || !v.chatKeys.length || v.chatKeys.length > 50 || v.chatKeys.some((k) => !CHAT.test(k))) throw new Error('可见范围必须是全局或指定会话');
   return { type: 'chats', chatKeys: unique(v.chatKeys).sort() };
 }
-export const memoryVisible = (r, chatKey) => r.visibility.type === 'global' || r.visibility.chatKeys.includes(chatKey);
+export const memoryVisible = (r, chatKey) => r.visibility.type === 'global' || r.visibility.chatKeys.includes(chatKey) || sharedPersonalProfile(r);
 const effective = (r) => !['deleted', 'superseded', 'expired'].includes(r.status) && (!r.expiresAt || r.expiresAt > Date.now());
 const sameSubjects = (a, b) => JSON.stringify([...a].sort()) === JSON.stringify([...b].sort());
 const localTo = (r, k) => r.visibility.type === 'chats' && r.visibility.chatKeys.length === 1 && r.visibility.chatKeys[0] === k;
@@ -57,11 +59,29 @@ export class MemoryStore {
       // Corruption must not silently reset memories or extraction progress.
       const db = JSON.parse(fs.readFileSync(this.file, 'utf8').replace(/^\uFEFF/, ''));
       if (db.schemaVersion !== 2 || !db.records || !db.persons || !db.jobs) throw new Error('记忆数据库格式错误，请从备份恢复');
-      this.state = db;
+      if (db.profileSharingVersion !== 1) this.#migrateProfiles(db);
+      else this.state = db;
       return;
     }
-    const db = { schemaVersion: 2, revision: 0, persons: {}, records: {}, jobs: {}, migrations: [] };
+    const db = { schemaVersion: 2, profileSharingVersion: 1, revision: 0, persons: {}, records: {}, jobs: {}, migrations: [] };
     this.#importLegacy(db);
+    this.#save(db);
+  }
+  #migrateProfiles(db) {
+    const backup = path.join('backups', `before-person-profile-${Date.now()}-${crypto.randomUUID()}`, 'v2.json');
+    fs.mkdirSync(path.dirname(path.join(this.directory, backup)), { recursive: true });
+    fs.copyFileSync(this.file, path.join(this.directory, backup));
+    const changed = [];
+    for (const r of Object.values(db.records)) {
+      const profileCategory = legacyProfileCategory(r);
+      if (!profileCategory) continue;
+      this.#put(db, { id: r.id, profileCategory }, { actor: 'profile-migration', expectedVersion: r.version });
+      changed.push(r.id);
+    }
+    db.profileSharingVersion = 1;
+    db.revision++;
+    (db.migrations ||= []).push({ type: 'stable-person-profile-v1', at: Date.now(), backup, recordIds: changed,
+      unchanged: Object.keys(db.records).length - changed.length });
     this.#save(db);
   }
   #save(db) {
@@ -136,6 +156,10 @@ export class MemoryStore {
       (includeInactive || effective(r))).sort((a, b) => b.updatedAt - a.updatedAt));
   }
   getRecord(id) { this.#load(); return clone(this.state.records[id] || null); }
+  profileMigration() {
+    this.#load();
+    return clone((this.state.migrations || []).find((m) => m.type === 'stable-person-profile-v1') || null);
+  }
   listPersons() {
     this.#load();
     return clone(Object.values(this.state.persons).map((p) => ({ ...p,
@@ -179,6 +203,18 @@ export class MemoryStore {
     r.sources = old?.sources || [];
     if (input._sources) r.sources = [...r.sources, ...input._sources.filter((s) => !r.sources.some((o) => o.chatKey === s.chatKey && o.messageId === s.messageId))];
     delete r._sources;
+    if (input.profileCategory !== undefined && input.profileCategory !== '' && !PROFILE_CATEGORIES.includes(input.profileCategory)) throw new Error('未知个人资料类别');
+    // Changing text/scope without an explicit reclassification must never retain an old share decision.
+    r.profileCategory = input.profileCategory ?? ((input.content !== undefined && input.content !== old?.content) ||
+      (input.visibility !== undefined && JSON.stringify(r.visibility) !== JSON.stringify(old?.visibility)) ? '' : (old?.profileCategory || ''));
+    r.profileSharingDisabled = old?.profileSharingDisabled || false;
+    if (actor === 'admin' && input.profileCategory !== undefined) r.profileSharingDisabled = input.profileCategory === '';
+    if (actor === 'admin' && old?.profileCategory && input.profileCategory === undefined && !r.profileCategory) r.profileSharingDisabled = true;
+    const shareIssue = r.profileCategory ? profileSharingIssue({ ...r, history: old ? [...(old.history || []), old] : [] }) : '';
+    if (shareIssue) {
+      if (actor === 'admin' && input.profileCategory && r.status === 'active') throw new Error(`不能共享个人资料：${shareIssue}`);
+      r.profileCategory = ''; // Keep the useful memory in its original scope.
+    }
     r.id = old?.id || `m_${crypto.randomUUID()}`;
     r.createdAt = old?.createdAt || Date.now(); r.updatedAt = Date.now(); r.version = (old?.version || 0) + 1;
     r.history = old ? [...old.history, { ...old, history: undefined, changedBy: actor, changedAt: r.updatedAt }] : [];
@@ -187,7 +223,7 @@ export class MemoryStore {
     return r;
   }
   saveRecord(input, { expectedVersion, actor = 'admin' } = {}) {
-    const fields = ['id', 'kind', 'content', 'subjectIds', 'visibility', 'status', 'title', 'eventId', 'expiresAt', 'pinned'];
+    const fields = ['id', 'kind', 'content', 'subjectIds', 'visibility', 'status', 'title', 'eventId', 'expiresAt', 'pinned', 'profileCategory'];
     const value = Object.fromEntries(fields.filter((k) => input[k] !== undefined).map((k) => [k, input[k]]));
     if (actor === 'admin') value.evidence = 'admin';
     return this.#transaction((db) => this.#put(db, value, { expectedVersion, actor }));
@@ -197,13 +233,27 @@ export class MemoryStore {
   recordFailure(chatKey, error) {
     return this.#transaction((db) => db.jobs[chatKey] = { ...this.job(chatKey), lastError: String(error).slice(0, 500), failures: (db.jobs[chatKey]?.failures || 0) + 1 });
   }
-  recordUsage(chatKey, usage) {
+  usageLedger() {
+    this.#load();
+    const calls = [], legacy = { untrackedCalls: 0, untrackedTokens: 0 };
+    for (const job of Object.values(this.state.jobs)) {
+      const tracked = job.usageCalls || [];
+      calls.push(...tracked);
+      legacy.untrackedCalls += Math.max(0, (job.usage?.calls || 0) - tracked.length);
+      legacy.untrackedTokens += Math.max(0, (job.usage?.totalTokens || 0) - tracked.reduce((sum, row) => sum + (row.usage?.totalTokens || 0), 0));
+    }
+    return clone({ calls, ...legacy });
+  }
+  recordUsage(chatKey, usage, meta = {}) {
     return this.#transaction((db) => {
       const job = this.job(chatKey), previous = job.usage || { calls: 0, promptTokens: 0, completionTokens: 0, totalTokens: 0 };
       const number = (v) => Math.max(0, Number(v) || 0);
-      const prompt = number(usage?.prompt_tokens), completion = number(usage?.completion_tokens);
+      const normalized = addUsage(emptyUsage(), usage); normalized.calls = 1;
+      const prompt = normalized.promptTokens, completion = normalized.completionTokens;
       job.usage = { calls: previous.calls + 1, promptTokens: previous.promptTokens + prompt,
-        completionTokens: previous.completionTokens + completion, totalTokens: previous.totalTokens + number(usage?.total_tokens || prompt + completion) };
+        completionTokens: previous.completionTokens + completion, totalTokens: previous.totalTokens + number(normalized.totalTokens) };
+      (job.usageCalls ||= []).push({ at: meta.at || Date.now(), model: String(meta.model || '(未知)'),
+        vendor: String(meta.vendor || ''), usage: normalized, usageReported: !!usage });
       db.jobs[chatKey] = job; return job.usage;
     });
   }
@@ -240,6 +290,7 @@ export class MemoryStore {
         if (!old && Object.values(db.records).some((r) => r.content === content && r.kind === c.kind && sameSubjects(r.subjectIds, ids) && localTo(r, chatKey))) continue;
         changed.push(this.#put(db, { id: c.targetId, kind: c.kind, content, subjectIds: ids, title: c.title || old?.title || '', eventId: c.eventId || old?.eventId || null,
           visibility: old?.visibility || { type: 'chats', chatKeys: [chatKey] }, evidence, _sources: sources,
+          profileCategory: c.profileCategory || '',
           status, expiresAt: c.expiresAt ?? old?.expiresAt ?? null }, { actor: 'extractor', expectedVersion: c.targetVersion }));
       }
       if (advance) db.jobs[chatKey] = { ...prior, cursor: Math.max(cursor, ...messages.map((m) => m.id)), lastSuccessAt: Date.now(), lastError: '', failures: 0 };

@@ -84,11 +84,13 @@ const TOOL_META = {
   // 记忆
   memory_append:     { name: '记一条',     cat: '记忆',   icon: '🧠' },
   memory_query:      { name: '查记忆',     cat: '记忆',   icon: '🧠' },
+  memory_person_query: { name: '查个人记忆', cat: '记忆', icon: '🧠' },
   memory_remove:     { name: '删记忆',     cat: '记忆',   icon: '🧹' },
   // 联网
   web_search:        { name: '联网搜索',   cat: '联网',   icon: '🌐' },
   web_fetch:         { name: '抓网页',     cat: '联网',   icon: '🔗' },
   // 其他
+  usage_query:       { name: '查用量费用', cat: '其他', icon: '📊' },
   report_feedback:   { name: '汇报反馈',   cat: '其他',   icon: '📣' },
   finish:            { name: '结束本次',   cat: '其他',   icon: '🏁' },
   get_computer_status: { name: '电脑状态', cat: '其他', icon: '🖥️' }
@@ -1796,7 +1798,8 @@ async function loadMemoryView() {
   try {
     const [cfg, chats] = await Promise.all([api('/api/config'), api('/api/chats')]);
     state.config = cfg;
-    const [files, people, records] = await Promise.all([api('/api/memory-files'), api('/api/memory/persons'), api('/api/memory/records?includeInactive=true')]);
+    const [files, people, records, migration] = await Promise.all([api('/api/memory-files'), api('/api/memory/persons'), api('/api/memory/records?includeInactive=true'), api('/api/memory/profile-migration')]);
+    state.memoryProfileMigration = migration.migration || null;
     state.memoryPersons = people.persons || [];
     state.allMemoryRecords = records.records || [];
     state.memoryFiles = files.files || [];
@@ -1852,7 +1855,11 @@ function startConsolidateTicker() {
 const memoryKinds = { fact: '事实', preference: '偏好', interaction: '交流习惯', relationship: '关系', event: '事件', commitment: '承诺' };
 const memoryStatuses = { active: '有效', pending: '待进行', in_progress: '进行中', completed: '已完成', cancelled: '已取消', superseded: '已替代', expired: '已过期', deleted: '已删除' };
 const memoryEvidence = { explicit: '本人明确表达', reported: '他人转述', inferred: '推断／待核实', admin: '人工确认', legacy: '历史导入／缺少原始证据' };
-function memoryScopeLabel(r) { return r.visibility.type === 'global' ? '全局' : r.visibility.chatKeys.join('、'); }
+const memoryProfileCategories = { '': '不作为共享个人资料', nickname: '稳定称呼', interest: '长期兴趣偏好', communication: '交流习惯' };
+function memoryScopeLabel(r) {
+  const source = r.visibility.type === 'global' ? '全局' : r.visibility.chatKeys.join('、');
+  return r.profileCategory ? '个人资料跨会话共享（' + (memoryProfileCategories[r.profileCategory] || r.profileCategory) + '），原范围：' + source : source;
+}
 function renderMemoryList() {
   const box = $('#memory-items');
   const mode = state.memoryView || 'persons';
@@ -1887,7 +1894,9 @@ async function loadMemoryDetail(key) {
     const busy = !!state.consolidating[key];
     const job = chatData?.job;
     const personInfo = p ? '<div class="hint">' + esc(p.userId ? '统一身份：QQ ' + p.userId : '旧记录缺少 QQ 号，可编辑条目确认主体') + '<br>曾用称呼：' + esc(p.aliases.map((a) => a.name + '（' + a.chatKey + '）').join('、') || '无') + '</div>' : '';
-    detail.innerHTML = '<div class="detail-header"><h2>' + esc(title) + '</h2>' + personInfo + '<div class="sub"><button class="btn btn-small" id="mem-add-record">＋ 添加记忆</button>' +
+    const migration = state.memoryProfileMigration;
+    const migrationInfo = migration ? '<div class="hint">旧记忆迁移：' + migration.recordIds.length + ' 条已标记为共享个人资料，' + migration.unchanged + ' 条保持原样。备份：' + esc(migration.backup) + '。可在条目编辑中关闭共享，来源与旧版本保留。</div>' : '';
+    detail.innerHTML = '<div class="detail-header"><h2>' + esc(title) + '</h2>' + personInfo + migrationInfo + '<div class="sub"><button class="btn btn-small" id="mem-add-record">＋ 添加记忆</button>' +
       (isChat ? '<button class="btn btn-small" id="mem-consolidate-btn" ' + (busy ? 'disabled' : '') + '>处理下一批新消息</button><span id="mem-consolidate-status" class="muted">' + esc(busy ? '处理中…' : state.consolidateResult[key]?.note || '') + '</span>' : '') + '</div>' +
       (job ? '<div class="hint">已处理至本地消息 ' + job.cursor + ' · 上次成功 ' + fmtTime(job.lastSuccessAt) + ' · 记忆模型 ' + (job.usage?.calls || 0) + ' 次 / ' + (job.usage?.totalTokens || 0) + ' tok' + (job.lastError ? '<br>上次失败：' + esc(job.lastError) + '（原进度已保留，可重试）' : '') + '</div>' : '') +
       (isChat && key.startsWith('group:') ? '<div class="field"><button class="btn btn-small" id="mem-load-members-btn">群成员与备注</button><span id="mem-members-status" class="muted"></span><div id="mem-members"></div></div>' : '') + '<div class="field-row"><select id="mem-kind-filter"><option value="">全部类型</option>' + Object.entries(memoryKinds).map(([v,l]) => '<option value="'+v+'">'+l+'</option>').join('') + '</select><label><input id="mem-history-toggle" type="checkbox"> 显示已删除／已替代／已过期</label></div></div><div id="mem-record-rows"></div>';
@@ -1923,6 +1932,7 @@ function openMemoryRecordModal(key, record = null) {
       '<div class="field"><label>涉及的 QQ 号（逗号分隔；机器人填 bot）</label><input id="mr-subjects" value="'+esc(r.subjectIds.map((x)=>x.replace(/^qq:/,'')).join(','))+'"></div>'+
       '<div class="field"><label>标题（事件或承诺）</label><input id="mr-title" value="'+esc(r.title||'')+'"></div>'+
       '<div class="field"><label>内容</label><textarea id="mr-content" maxlength="2000" style="min-height:140px">'+esc(r.content)+'</textarea></div>'+
+      '<div class="field"><label>稳定个人资料</label><select id="mr-profile">'+opts(memoryProfileCategories,r.profileCategory||'')+'</select><div class="hint">只共享群聊中的单人称呼、长期兴趣或交流习惯。具体经历、私聊来源和敏感内容保持原范围。关闭后，自动抽取不能重新开启此条目共享。人工确认仍须满足类别与来源限制。</div></div>'+
       '<div class="field"><label>可见范围</label><select id="mr-scope"><option value="chats" '+(r.visibility.type==='chats'?'selected':'')+'>指定会话</option><option value="global" '+(r.visibility.type==='global'?'selected':'')+'>全局</option></select><input id="mr-chats" placeholder="例如 group:123,private:456" value="'+esc(r.visibility.chatKeys.join(','))+'"><div class="hint">私聊和群聊记录默认保持在来源会话内。选择全局后可跨会话使用。</div></div>'+
       '<div class="field"><label>关联事件（可选）</label><select id="mr-event"><option value="">无</option>'+eventOptions.map((e)=>'<option value="'+esc(e.id)+'" '+(e.id===r.eventId?'selected':'')+'>'+esc(e.title||e.content.slice(0,50))+'</option>').join('')+'</select></div>'+
       '<div class="field"><label>过期时间（可选，本地时间）</label><input id="mr-expires" type="datetime-local"></div>'+
@@ -1938,7 +1948,7 @@ function openMemoryRecordModal(key, record = null) {
     try {
       const body = remove ? { expectedVersion:r.version } : { expectedVersion:r.version, kind:q('#mr-kind').value, status:q('#mr-status').value,
         subjectIds:q('#mr-subjects').value.split(/[,，\s]+/).filter(Boolean), content:q('#mr-content').value, title:q('#mr-title').value,
-        visibility:{type:q('#mr-scope').value,chatKeys:q('#mr-chats').value.split(/[,，\s]+/).filter(Boolean)},
+        visibility:{type:q('#mr-scope').value,chatKeys:q('#mr-chats').value.split(/[,，\s]+/).filter(Boolean)}, profileCategory:q('#mr-profile').value,
         pinned:q('#mr-pinned').checked, eventId:q('#mr-event').value||null, expiresAt:q('#mr-expires').value?new Date(q('#mr-expires').value).getTime():null };
       await api('/api/memory/records'+(record?'/'+r.id:''),{method:remove?'DELETE':record?'PUT':'POST',body:JSON.stringify(body)});
       closeModelModal(overlay); await loadMemoryView();
@@ -2652,6 +2662,9 @@ const RUN_LIMIT_FIELDS = [
   ['maxToolCalls', '常规工具调用预算（每个调用单独计数）', 12, 1, 100],
   ['maxSearchCalls', '搜索次数预算', 3, 0, 20], ['maxPageReads', '网页正文读取预算', 4, 0, 20],
   ['maxImagePages', '网页取图预算', 4, 0, 20], ['maxInputTokens', '聊天模型累计输入 token 预算', 120000, 1000, 2000000],
+  ['maxContextTokens', '单次请求上下文容量（估算 token）', 65536, 4096, 2000000],
+  ['contextReserveTokens', '单次请求预留输出 token', 4096, 512, 128000],
+  ['contextImageTokens', '每张输入图片的估算 token', 8192, 256, 65536],
   ['maxRunMs', '常规处理时长预算（毫秒）', 180000, 10000, 1800000],
   ['noProgressLimit', '连续无进展次数', 3, 2, 10], ['toolResultMaxChars', '单次工具文字上限', 6000, 1000, 20000]
 ];
@@ -2687,7 +2700,7 @@ function renderApiSection(c) {
       <div class="field"><label>温度</label><input type="number" id="cfg-temperature" step="0.1" min="0" max="2" value="${esc(c.api.temperature)}" /></div>
       <div class="field"><label>单次运行常规模型请求预算</label><input type="number" id="cfg-maxrounds" min="1" max="40" value="${esc(c.api.maxRounds)}" /></div>
       ${RUN_LIMIT_FIELDS.map(([key, label, fallback, min, max]) => `<div class="field"><label>${label}</label><input type="number" id="cfg-run-${key}" min="${min}" max="${max}" value="${esc(c.runLimits?.[key] ?? fallback)}"></div>`).join('')}
-      <div class="hint">模型请求和工具执行分别计数，0 次分类预算表示关闭该类探索。每轮末尾向模型提示剩余额度。耗尽或连续无进展且未回复时，独立收尾最多 3 次模型请求、4 次工具执行，允许已有图片导入、看图和发送，每种工具最多一次；仍未回复再保留一次纯文字请求。不再搜索或生图，不自动重试收尾。token 和时长在请求之间检查，单次请求可能越过阈值。搜索子模型 token 单独统计。</div>
+      <div class="hint">累计输入预算统计已报告用量；单次上下文容量独立检查本次消息、工具定义与图片估算，并预留输出空间。不同模型分词和图片计费不同，请按所用模型调整容量、预留与图片估值。超限先停止探索；收尾可移除较早工具结果和工具图片，仍放不下则本地报错，不发送超限请求。系统提示和本轮聊天不裁剪，原始存档保留。模型请求和工具执行分别计数，0 次分类预算表示关闭该类探索。预算耗尽或连续无进展且未回复时，独立收尾最多 3 次模型请求、4 次工具执行，每种工具最多一次；仍未回复再保留一次纯文字请求。不再搜索或生图，不自动重试收尾。搜索子模型 token 单独统计。</div>
     </div>
     <div class="checkbox-row"><input type="checkbox" id="cfg-vision" ${c.api.vision !== false ? 'checked' : ''} />
       <label for="cfg-vision">图片输入（关闭则移除看图工具，模型只会看到 [图片] 占位符）</label>

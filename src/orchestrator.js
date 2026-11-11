@@ -20,6 +20,7 @@ import { MemoryPipeline } from './memory-pipeline.js';
 import { selectWindow, messageAllowed, assertContextAllowed, recallMemories, primarySubjects } from './context.js';
 import { permissions, parseCommand } from './permissions.js';
 import { RunBudget, CompletionBudget, COMPLETION_TOOLS, budgetNotice, boundedToolText } from './run-budget.js';
+import { inspectRequestContext, assertRequestContext } from './request-context.js';
 import { finalizeRun } from './run-finalization.js';
 import { ResponseActivity, responseSettings } from './response-rules.js';
 import { sliderToTier } from './tier-slider.js';
@@ -670,6 +671,7 @@ export class Orchestrator {
       memory: this.memory,
       stickers: this.stickers,
       mcp: this.mcp,
+      sessions: this.sessions,
       sender: this.sender,
       session,
       assertRunAllowed: tierInfo?.manualReply ? () => this.#assertManualReplyAllowed(chatKey) : undefined,
@@ -679,10 +681,11 @@ export class Orchestrator {
 
     const maxRounds = Math.min(40, Math.max(1, Number(cfg.api.maxRounds) || 12));
     const budget = new RunBudget(cfg.runLimits);
+    ctx.toolResultMaxChars = budget.limits.toolResultMaxChars;
     const completion = new CompletionBudget();
     budget.startedAt = session.budget?.startedAt ?? budget.startedAt;
-    let modelAttempts = session.budget?.modelAttempts || 0, stopReason = null;
-    const saveBudget = () => { session.budget = { ...budget.snapshot(), startedAt: budget.startedAt, modelAttempts, maxModelCalls: maxRounds, stopReason, completion: completion.snapshot() }; };
+    let modelAttempts = session.budget?.modelAttempts || 0, stopReason = null, requestContext = null;
+    const saveBudget = () => { session.budget = { ...budget.snapshot(), startedAt: budget.startedAt, modelAttempts, maxModelCalls: maxRounds, stopReason, requestContext, completion: completion.snapshot() }; };
     saveBudget();
     session.searchUsageCalls ||= [];
     session.usageByPhase ||= { first: emptyUsage(), continuation: emptyUsage() };
@@ -715,9 +718,12 @@ export class Orchestrator {
       markActivity('正在思考…');
       // 网络抖动/5xx/429 会自动重试（同一轮请求，messages 不变，幂等不重复发言）
       let response;
-      try { response = await chatCompletionWithRetry({ messages, tools: openAiTools, beforeRequest: () => {
+      try { response = await chatCompletionWithRetry({ messages, tools: openAiTools, contextLimits: budget.limits, beforeRequest: () => {
         const reason = budget.stopReason(session.usage) || (modelAttempts >= maxRounds ? 'model_budget' : null);
         if (reason) throw Object.assign(new Error(reason), { runLimit: reason });
+        requestContext = inspectRequestContext(messages, openAiTools, budget.limits);
+        saveBudget();
+        assertRequestContext(messages, openAiTools, budget.limits);
         assertContextAllowed(session, this.memory, chatKey);
         if (this.paused || this.aborted) throw new Error('机器人已暂停');
         if (tierInfo?.manualReply) this.#assertManualReplyAllowed(chatKey);
@@ -875,7 +881,7 @@ export class Orchestrator {
     session.terminationReason = stopReason || (finish ? 'model_finish' : 'model_stop');
     if (stopReason && !session.sent.length) {
       await finalizeRun({ messages, session, availableDefs, ctx, assertActive, markActivity,
-        completion, reason: stopReason, maxChars: budget.limits.toolResultMaxChars, parseInlineToolCalls });
+        completion, reason: stopReason, maxChars: budget.limits.toolResultMaxChars, contextLimits: budget.limits, parseInlineToolCalls });
       saveBudget();
     }
 
@@ -962,17 +968,21 @@ export class Orchestrator {
     const cfg = getConfig();
     const mem = cfg.memory || {};
     if (mem.useChatModel !== false) {
-      return chatCompletion({ messages, temperature: 0.2 });
+      const vendor = vendorOfConfig(cfg);
+      const response = await chatCompletion({ messages, temperature: 0.2 });
+      return { ...response, usageMeta: { at: Date.now(), vendor, model: response.model || cfg.api.model } };
     }    const providers = currentProviders();
     const p = providers.find((x) => x.id === mem.provider);
     if (!p?.baseURL || !p?.apiKey || !mem.model) {
       throw new Error('记忆整理专用模型未配置：请在设置 → 记忆里选择提供商与模型');
     }
-    return chatCompletion({
+    const vendor = vendorOfConfig({ providers, api: { provider: p.id, baseUrl: p.baseURL } });
+    const response = await chatCompletion({
       messages,
       temperature: 0.2,
       overrides: { baseUrl: p.baseURL, apiKey: p.apiKey, model: mem.model, timeoutMs: 180000 }
     });
+    return { ...response, usageMeta: { at: Date.now(), vendor, model: response.model || mem.model } };
   }
 
   stopProactiveLoop() {

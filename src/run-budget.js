@@ -1,17 +1,21 @@
 // Per-run limits. A model request and each tool execution are distinct units.
 export const DEFAULT_RUN_LIMITS = {
   maxToolCalls: 12, maxSearchCalls: 3, maxPageReads: 4, maxImagePages: 4,
-  maxInputTokens: 120000, maxRunMs: 180000, noProgressLimit: 3, toolResultMaxChars: 6000
+  maxInputTokens: 120000, maxRunMs: 180000, noProgressLimit: 3, toolResultMaxChars: 6000,
+  maxContextTokens: 65536, contextReserveTokens: 4096, contextImageTokens: 8192
 };
 export const RUN_LIMIT_RANGES = {
   maxToolCalls: [1, 100], maxSearchCalls: [0, 20], maxPageReads: [0, 20], maxImagePages: [0, 20],
-  maxInputTokens: [1000, 2000000], maxRunMs: [10000, 1800000], noProgressLimit: [2, 10], toolResultMaxChars: [1000, 20000]
+  maxInputTokens: [1000, 2000000], maxRunMs: [10000, 1800000], noProgressLimit: [2, 10], toolResultMaxChars: [1000, 20000],
+  maxContextTokens: [4096, 2000000], contextReserveTokens: [512, 128000], contextImageTokens: [256, 65536]
 };
 export function normalizeRunLimits(value = {}) {
-  return Object.fromEntries(Object.entries(DEFAULT_RUN_LIMITS).map(([k, fallback]) => {
+  const normalized = Object.fromEntries(Object.entries(DEFAULT_RUN_LIMITS).map(([k, fallback]) => {
     const n = value?.[k]; const [min, max] = RUN_LIMIT_RANGES[k];
     return [k, n != null && Number.isFinite(Number(n)) ? Math.max(min, Math.min(max, Math.floor(Number(n)))) : fallback];
   }));
+  normalized.contextReserveTokens = Math.min(normalized.contextReserveTokens, normalized.maxContextTokens - 1024);
+  return normalized;
 }
 const limitsByTool = { web_search: 'maxSearchCalls', web_fetch: 'maxPageReads', get_webpage_images: 'maxImagePages' };
 export const COMPLETION_LIMITS = Object.freeze({ modelCalls: 3, toolCalls: 4 });

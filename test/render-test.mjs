@@ -708,8 +708,11 @@ try {
       chatOk ? pass++ : fail++; console.log('  '+(chatOk?'OK   ':'FAIL ')+'会话增量入口、备注功能与记忆用量');
       ctx.openMemoryRecordModal('group:1', record);
       const modal = document.body.children.at(-1).innerHTML;
-      const formOk = modal.includes('mr-pinned') && modal.includes('mr-scope') && modal.includes('mr-status') && modal.includes('mr-subjects');
+      const formOk = modal.includes('mr-pinned') && modal.includes('mr-scope') && modal.includes('mr-status') && modal.includes('mr-subjects') && modal.includes('mr-profile') && modal.includes('长期兴趣偏好');
       formOk ? pass++ : fail++; console.log('  '+(formOk?'OK   ':'FAIL ')+'逐条管理表单包含固定、范围、状态与多主体');
+      const profileLabel = ctx.memoryScopeLabel({ ...record, profileCategory: 'interest' });
+      const labelOk = profileLabel.includes('个人资料跨会话共享') && profileLabel.includes('原范围：group:1');
+      labelOk ? pass++ : fail++; console.log('  '+(labelOk?'OK   ':'FAIL ')+'共享个人资料显示类别并保留原范围');
     } finally { sandbox.fetch = oldFetch; }
   }
 
@@ -720,7 +723,8 @@ try {
     const html = ctx.renderApiSection(settings);
     const renderOk = html.includes('cfg-maxrounds') && html.includes('cfg-run-maxToolCalls')
       && html.includes('id="cfg-run-maxSearchCalls" min="0" max="20" value="0"')
-      && html.includes('cfg-run-maxInputTokens') && html.includes('cfg-run-noProgressLimit');
+      && html.includes('cfg-run-maxInputTokens') && html.includes('cfg-run-noProgressLimit')
+      && html.includes('cfg-run-maxContextTokens') && html.includes('cfg-run-contextReserveTokens') && html.includes('cfg-run-contextImageTokens');
     renderOk ? pass++ : fail++;
     console.log('  ' + (renderOk ? 'OK   ' : 'FAIL ') + '模型、工具、输入与无进展预算独立显示，零搜索额度保留');
     const savedFetch = sandbox.fetch;
@@ -738,9 +742,13 @@ try {
       document.querySelector('#cfg-run-maxToolCalls').value = '9';
       document.querySelector('#cfg-run-maxSearchCalls').value = '0';
       document.querySelector('#cfg-run-maxInputTokens').value = '80000';
+      document.querySelector('#cfg-run-maxContextTokens').value = '32000';
+      document.querySelector('#cfg-run-contextReserveTokens').value = '3000';
+      document.querySelector('#cfg-run-contextImageTokens').value = '6000';
       await ctx.saveConfig();
       if (posted?.api?.maxRounds !== 7 || posted?.runLimits?.maxToolCalls !== 9
-        || posted.runLimits.maxSearchCalls !== 0 || posted.runLimits.maxInputTokens !== 80000) throw new Error('预算保存不正确');
+        || posted.runLimits.maxSearchCalls !== 0 || posted.runLimits.maxInputTokens !== 80000
+        || posted.runLimits.maxContextTokens !== 32000 || posted.runLimits.contextReserveTokens !== 3000 || posted.runLimits.contextImageTokens !== 6000) throw new Error('预算保存不正确');
       pass++; console.log('  OK   独立预算通过配置保存路径提交');
     } catch (e) { fail++; console.log('  FAIL  预算设置保存：' + e.message); }
     finally { sandbox.fetch = savedFetch; }

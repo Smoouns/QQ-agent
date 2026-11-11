@@ -8,13 +8,14 @@ import { ChatStore } from '../src/store.js';
 import { MemoryStore } from '../src/memory.js';
 import { SessionRegistry } from '../src/sessions.js';
 import { Orchestrator } from '../src/orchestrator.js';
+import { inspectRequestContext } from '../src/request-context.js';
 
 let checks = 0;
 const check = async (name, fn) => { await fn(); console.log(`✓ ${++checks}. ${name}`); };
 const call = (name, args = {}) => ({ id: `call_${name}`, type: 'function', function: { name, arguments: JSON.stringify(args) } });
 const originalFetch = globalThis.fetch;
 let keyId = 800;
-async function run({ modelCalls = 12, limits = {}, reply, tools = {}, beforeFinal, sendError, revokeBeforeSend = false, vision = true }) {
+async function run({ modelCalls = 12, limits = {}, reply, tools = {}, beforeFinal, sendError, revokeBeforeSend = false, vision = true, userText = '请查资料并回复' }) {
   const cfg = structuredClone(DEFAULT_CONFIG);
   cfg.allowAllWhenEmpty = true; cfg.memory.consolidateEnabled = false; cfg.sticker.enabled = false;
   cfg.providersImported = true; cfg.api.provider = ''; cfg.api.model = 'budget-mock'; cfg.api.baseUrl = 'https://model.example/v1';
@@ -39,7 +40,7 @@ async function run({ modelCalls = 12, limits = {}, reply, tools = {}, beforeFina
     return Response.json({ choices: [{ message: { role: 'assistant', ...(final ? { content: '根据已有资料找到线索，但尚未确认图片。' } : {}), ...next } }],
       usage: { prompt_tokens: 100, completion_tokens: 10, total_tokens: 110 } });
   };
-  store.appendIncoming(key, { mid: 1, senderId: '123', text: '请查资料并回复' });
+  store.appendIncoming(key, { mid: 1, senderId: '123', text: userText });
   try {
     await orch.wake(key);
     return { requests, effects, session: sessions.get(sessions.index[0].id), store, key };
@@ -134,6 +135,29 @@ await check('累计输入达到阈值后转入收尾，不继续执行探索工�
     reply: (_b, _n, final) => final ? { content: '基于已有资料的结果。' } : { tool_calls: [call('get_recent_messages')] } });
   assert.equal(r.requests.length, 11); assert.equal(r.session.budget.toolCalls, 9);
   assert.equal(r.session.terminationReason, 'input_budget'); assert.equal(r.effects.length, 1);
+});
+
+await check('工具结果撑满单次容量时不发超限请求，裁减收尾上下文且保留日志', async () => {
+  const baseline = await run({ reply: () => ({ tool_calls: [call('finish', { summary: '基线' })] }) });
+  const initialSize = inspectRequestContext(baseline.requests[0].messages, baseline.requests[0].tools, {}).estimatedInputTokens;
+  const limits = { maxContextTokens: initialSize + 4500, contextReserveTokens: 4096, maxInputTokens: 2000000, toolResultMaxChars: 20000 };
+  const r = await run({ limits, tools: { get_recent_messages: async () => ({ content: '很长的证据'.repeat(3000) }) },
+    reply: (_b, _n, final) => final ? { content: '只根据当前可见资料收尾。' } : { tool_calls: [call('get_recent_messages')] } });
+  assert.equal(r.session.terminationReason, 'context_capacity');
+  assert.equal(r.requests.length, 2); assert.equal(r.session.budget.modelAttempts, 1);
+  assert.equal(r.session.budget.toolCalls, 1); assert.equal(r.effects.length, 1);
+  assert.ok(r.requests.every(b => inspectRequestContext(b.messages, b.tools, limits).fits));
+  assert.ok(r.session.finalization.contextChecks.some(c => c.removed.some(x => x.type === 'tool_result')));
+  assert.ok(r.session.messages.find(m => m.toolCall?.name === 'get_recent_messages').toolCall.result.includes('很长的证据'));
+  assert.match(r.requests[1].messages.find(m => m.role === 'tool').content, /已从当前请求移除/);
+});
+
+await check('初始聊天本身超限时正常请求与收尾都不发送，错误可诊断', async () => {
+  const r = await run({ limits: { maxContextTokens: 4096, contextReserveTokens: 1024 }, userText: '内容'.repeat(5000) });
+  assert.equal(r.requests.length, 0); assert.equal(r.effects.length, 0);
+  assert.equal(r.session.budget.modelAttempts, 0); assert.equal(r.session.finalization.modelAttempts, 0);
+  assert.equal(r.session.terminationReason, 'context_capacity');
+  assert.equal(r.session.status, 'error'); assert.match(r.session.error, /上下文容量不足/);
 });
 
 await check('HTTP 重试也占模型请求预算，不能用重试突破额度', async () => {
